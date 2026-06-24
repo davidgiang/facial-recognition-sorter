@@ -50,20 +50,50 @@ pub fn is_image(path: &Path) -> bool {
     path.extension()
         .map(|ext| {
             let ext = ext.to_string_lossy().to_lowercase();
-            matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif" | "heic" | "ithmb")
+            matches!(
+                ext.as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif" | "heic" | "ithmb"
+                    | "tif" | "tiff" | "nef" | "cr2"
+            )
         })
         .unwrap_or(false)
 }
 
+/// Camera RAW formats that need a dedicated decoder (the `image` crate can't
+/// open them). Canon CR2 is handled by the pure-Rust raw pipeline; Nikon NEF
+/// falls through to the ffmpeg path in `load_image_robustly`.
+fn is_raw(ext: &str) -> bool {
+    matches!(ext, "nef" | "cr2")
+}
+
+/// Decode a camera RAW file to RGB via the pure-Rust rawloader/imagepipe
+/// pipeline. Works for Canon CR2 (and other models imagepipe supports).
+fn decode_raw(path: &Path) -> anyhow::Result<image::DynamicImage> {
+    let decoded = imagepipe::simple_decode_8bit(path, 0, 0)
+        .map_err(|e| anyhow::anyhow!("raw decode failed: {e}"))?;
+    let buf = image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
+        .ok_or_else(|| anyhow::anyhow!("raw decode produced an unexpected buffer size"))?;
+    Ok(image::DynamicImage::ImageRgb8(buf))
+}
+
 pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
-    // Try standard image crate first
+    // Try standard image crate first (jpg, png, gif, webp, tiff, ...)
     if let Ok(img) = image::open(path) {
         return Ok(img);
     }
 
-    // Fallback to ffmpeg for HEIC or if standard open fails
     let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
-    if ext == "heic" || ext == "avif" {
+
+    // Camera RAW: try the pure-Rust raw pipeline (handles Canon CR2 and more).
+    if is_raw(&ext) {
+        if let Ok(img) = decode_raw(path) {
+            return Ok(img);
+        }
+    }
+
+    // Fallback to ffmpeg for HEIC/AVIF and for RAW the raw pipeline couldn't
+    // handle (e.g. Nikon NEF, which ffmpeg decodes but imagepipe does not).
+    if matches!(ext.as_str(), "heic" | "avif") || is_raw(&ext) {
         if let Some(ffmpeg_cmd) = find_ffmpeg_path() {
             let output = Command::new(&ffmpeg_cmd)
                 .hide_window()
