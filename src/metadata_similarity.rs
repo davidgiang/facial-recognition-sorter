@@ -35,7 +35,7 @@ const MTIME_COLLISION_CONFIDENCE: f32 = 0.05;
 const MTIME_COLLISION_BUCKET_SECS: i64 = 600;
 /// A bucket with more than this many mtime-sourced files is treated as a
 /// bulk-transfer artifact.
-const MTIME_COLLISION_THRESHOLD: u32 = 15;
+const MTIME_COLLISION_THRESHOLD: u32 = 1000;
 
 /// Offset between the Mac/QuickTime epoch (1904-01-01) and Unix epoch
 /// (1970-01-01), in seconds - used to decode MP4/MOV `mvhd` creation time.
@@ -635,8 +635,8 @@ mod tests {
     #[test]
     fn mtime_confidence_drops_when_many_files_share_a_bucket() {
         let mut buckets: HashMap<i64, u32> = HashMap::new();
-        buckets.insert(0, 3);
-        buckets.insert(1, 25);
+        buckets.insert(0, 25);
+        buckets.insert(1, 1500);
 
         let sparse = PhotoMeta { secs: 100, time_source: TimeSource::Mtime, camera: None, gps: None, sequence: None };
         let bulk = PhotoMeta { secs: MTIME_COLLISION_BUCKET_SECS + 5, time_source: TimeSource::Mtime, camera: None, gps: None, sequence: None };
