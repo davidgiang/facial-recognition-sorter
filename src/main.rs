@@ -46,22 +46,31 @@ struct TargetCache {
     entries: Vec<PersonInfo>,
 }
 
+/// Where the face database, caches, thumbnails and settings live.
+///
+/// Local builds share the installed app's directory under AppData rather than
+/// writing into the working directory, so running from `cargo run` reuses the
+/// database and thumbnail cache instead of rebuilding them. Set `FRS_DATA_DIR`
+/// to point a build at a scratch directory instead.
 pub fn get_app_data_dir() -> PathBuf {
-    // Developer Mode Check: If Cargo.toml is in the current working directory,
-    // we assume we are running locally in development and save data here.
-    if Path::new("Cargo.toml").exists() {
-        return PathBuf::from(".");
-    }
+    static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-    // Production Mode: Save to AppData/Roaming/Facial Recognition Sorter
-    if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "Facial Recognition Sorter") {
-        let data_dir = proj_dirs.data_dir();
-        if !data_dir.exists() {
-            let _ = fs::create_dir_all(data_dir);
-        }
-        return data_dir.to_path_buf();
-    }
-    PathBuf::from(".")
+    DATA_DIR
+        .get_or_init(|| {
+            let dir = std::env::var_os("FRS_DATA_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    directories::ProjectDirs::from("", "", "Facial Recognition Sorter")
+                        .map(|proj_dirs| proj_dirs.data_dir().to_path_buf())
+                })
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            if !dir.exists() {
+                let _ = fs::create_dir_all(&dir);
+            }
+            dir
+        })
+        .clone()
 }
 
 pub fn get_target_cache_file() -> PathBuf {
