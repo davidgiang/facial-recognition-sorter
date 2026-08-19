@@ -107,9 +107,14 @@ pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
         }
     }
 
-    // Fallback to ffmpeg for HEIC/AVIF and for RAW the raw pipeline couldn't
-    // handle (e.g. Nikon NEF, which ffmpeg decodes but imagepipe does not).
-    if matches!(ext.as_str(), "heic" | "avif") || is_raw(&ext) {
+    // Last resort: ffmpeg's decoders are far more lenient than the `image`
+    // crate's (e.g. `zune-jpeg`, our default JPEG decoder, can reject a real,
+    // viewable JPEG that every other photo viewer opens fine - the same
+    // class of issue as image::open's PNG signature check rejecting a
+    // mislabeled-but-valid file above). Not gated to specific extensions:
+    // any format ffmpeg understands is worth trying once the two attempts
+    // above have both failed.
+    {
         if let Some(ffmpeg_cmd) = find_ffmpeg_path() {
             let output = Command::new(&ffmpeg_cmd)
                 .hide_window()
