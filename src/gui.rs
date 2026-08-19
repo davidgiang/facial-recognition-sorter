@@ -23,6 +23,7 @@ const ORIGINS_FILE: &str = ".origins.json";
 enum Tab {
     Matches,
     PersonFolder,
+    MetadataSimilarity,
 }
 
 /// Longest edge a decoded thumbnail keeps. Thumbnails are drawn at most a few
@@ -162,6 +163,7 @@ fn paint_thumbnail(
 enum ThumbTarget {
     Matches,
     Person,
+    MetaSim,
     /// The pop-out viewer, which decodes one photo at a larger size.
     Viewer,
 }
@@ -271,6 +273,16 @@ pub struct FaceSearchApp {
     /// File name inside the person folder -> path the photo was copied from.
     person_origins: HashMap<String, PathBuf>,
 
+    // "Similar Timing" (metadata-similarity) tab state
+    metasim_window_minutes: f32,
+    metasim_scanning: bool,
+    metasim_ranked: Vec<crate::metadata_similarity::MetaSimCandidate>,
+    metasim_images_cache: Vec<(crate::metadata_similarity::MetaSimCandidate, Option<Result<egui::TextureHandle, String>>)>,
+    metasim_page: usize,
+    metasim_scroll_to_top: bool,
+    metasim_pending_thumbs: Vec<PathBuf>,
+    metasim_thumb_gen: Arc<AtomicU64>,
+
     // Log history for display during processing
     log_messages: Vec<String>,
 
@@ -282,6 +294,12 @@ pub struct FaceSearchApp {
     rx: Receiver<UiMessage>,
     thumb_tx: Sender<ThumbResult>,
     thumb_rx: Receiver<ThumbResult>,
+    metasim_tx: Sender<MetaSimMessage>,
+    metasim_rx: Receiver<MetaSimMessage>,
+}
+
+pub enum MetaSimMessage {
+    Done(Vec<crate::metadata_similarity::MetaSimCandidate>),
 }
 
 pub enum UiMessage {
@@ -294,6 +312,7 @@ impl Default for FaceSearchApp {
     fn default() -> Self {
         let (tx, rx) = channel();
         let (thumb_tx, thumb_rx) = channel();
+        let (metasim_tx, metasim_rx) = channel();
         let settings = AppSettings::load();
         let mut people_dir = settings.people_dir.clone();
         let mut selected_person = settings.selected_person.clone();
@@ -348,12 +367,22 @@ impl Default for FaceSearchApp {
             matches_thumb_gen: Arc::new(AtomicU64::new(0)),
             person_thumb_gen: Arc::new(AtomicU64::new(0)),
             person_origins: HashMap::new(),
+            metasim_window_minutes: 60.0,
+            metasim_scanning: false,
+            metasim_ranked: Vec::new(),
+            metasim_images_cache: Vec::new(),
+            metasim_page: 0,
+            metasim_scroll_to_top: false,
+            metasim_pending_thumbs: Vec::new(),
+            metasim_thumb_gen: Arc::new(AtomicU64::new(0)),
             log_messages: Vec::new(),
             scroll_to_top: false,
             tx,
             rx,
             thumb_tx,
             thumb_rx,
+            metasim_tx,
+            metasim_rx,
         }
     }
 }
@@ -776,6 +805,30 @@ impl FaceSearchApp {
         self.person_thumb_gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn metasim_total_pages(&self) -> usize {
+        if self.page_size == 0 { return 1; }
+        let total = self.metasim_ranked.len();
+        if total == 0 { return 1; }
+        (total + self.page_size - 1) / self.page_size
+    }
+
+    fn load_metasim_page(&mut self, page: usize) {
+        self.metasim_images_cache.clear();
+        let start = page * self.page_size;
+        let end = (start + self.page_size).min(self.metasim_ranked.len());
+        for candidate in &self.metasim_ranked[start..end] {
+            self.metasim_images_cache.push((candidate.clone(), None));
+        }
+        self.metasim_page = page;
+        self.metasim_scroll_to_top = true;
+        self.metasim_pending_thumbs = self
+            .metasim_images_cache
+            .iter()
+            .map(|(candidate, _)| candidate.path.clone())
+            .collect();
+        self.metasim_thumb_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Decode a page worth of thumbnails on the rayon pool. Results stream back
     /// through `thumb_rx`, so the grid fills in progressively instead of
     /// blocking the UI thread on every file in turn.
@@ -783,6 +836,7 @@ impl FaceSearchApp {
         let paths = match target {
             ThumbTarget::Matches => std::mem::take(&mut self.matches_pending_thumbs),
             ThumbTarget::Person => std::mem::take(&mut self.person_pending_thumbs),
+            ThumbTarget::MetaSim => std::mem::take(&mut self.metasim_pending_thumbs),
             ThumbTarget::Viewer => Vec::new(),
         };
         if paths.is_empty() {
@@ -792,6 +846,7 @@ impl FaceSearchApp {
         let counter = match target {
             ThumbTarget::Matches => self.matches_thumb_gen.clone(),
             ThumbTarget::Person => self.person_thumb_gen.clone(),
+            ThumbTarget::MetaSim => self.metasim_thumb_gen.clone(),
             ThumbTarget::Viewer => return,
         };
         let generation = counter.load(Ordering::Relaxed);
@@ -821,6 +876,7 @@ impl FaceSearchApp {
             let current = match result.target {
                 ThumbTarget::Matches => self.matches_thumb_gen.load(Ordering::Relaxed),
                 ThumbTarget::Person => self.person_thumb_gen.load(Ordering::Relaxed),
+                ThumbTarget::MetaSim => self.metasim_thumb_gen.load(Ordering::Relaxed),
                 // The viewer holds one photo, so the open path is the only check.
                 ThumbTarget::Viewer => result.generation,
             };
@@ -850,6 +906,13 @@ impl FaceSearchApp {
                 ThumbTarget::Person => {
                     for entry in self.person_images_cache.iter_mut() {
                         if entry.0 == result.path && entry.1.is_none() {
+                            entry.1 = Some(texture.clone());
+                        }
+                    }
+                }
+                ThumbTarget::MetaSim => {
+                    for entry in self.metasim_images_cache.iter_mut() {
+                        if entry.0.path == result.path && entry.1.is_none() {
                             entry.1 = Some(texture.clone());
                         }
                     }
@@ -1289,6 +1352,22 @@ impl eframe::App for FaceSearchApp {
                     self.is_processing = false;
                     self.log_messages.clear();
                     self.status_msg = format!("Error: {}", err);
+                }
+            }
+        }
+
+        while let Ok(msg) = self.metasim_rx.try_recv() {
+            match msg {
+                MetaSimMessage::Done(ranked) => {
+                    self.metasim_scanning = false;
+                    let total = ranked.len();
+                    self.metasim_ranked = ranked;
+                    self.load_metasim_page(0);
+                    if total > 0 {
+                        self.status_msg = format!("Found {} candidates by timing/camera/color similarity.", total);
+                    } else {
+                        self.status_msg = "No candidates found within the time window.".to_string();
+                    }
                 }
             }
         }
@@ -1855,13 +1934,17 @@ impl eframe::App for FaceSearchApp {
                         "👤 Person Folder ({})",
                         self.target_image_count + self.target_video_count
                     );
+                    let metasim_label =
+                        format!("🕒 Similar Timing ({})", self.metasim_ranked.len());
                     ui.selectable_value(&mut self.active_tab, Tab::Matches, matches_label);
                     ui.selectable_value(&mut self.active_tab, Tab::PersonFolder, person_label);
+                    ui.selectable_value(&mut self.active_tab, Tab::MetadataSimilarity, metasim_label);
                 });
 
                 match self.active_tab {
                     Tab::Matches => self.show_matches_tab(ui, ctx),
                     Tab::PersonFolder => self.show_person_tab(ui, ctx),
+                    Tab::MetadataSimilarity => self.show_metadata_similarity_tab(ui, ctx),
                 }
             }
         });
@@ -2055,6 +2138,289 @@ impl FaceSearchApp {
                 Ok(()) => {
                     self.all_ranked_matches.retain(|(p, _)| p != &path);
                     self.matched_images_cache.retain(|(p, ..)| p != &path);
+                    if self.viewer.as_ref().map(|v| &v.path) == Some(&path) {
+                        self.viewer = None;
+                    }
+                    self.status_msg = format!(
+                        "Moved {} to the Recycle Bin.",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                Err(e) => {
+                    self.status_msg = format!("Could not move {} to the Recycle Bin: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    /// Kick off a background scan ranking every photo in the input directory
+    /// by EXIF timestamp/camera/color proximity to the confirmed photos
+    /// already in this person's folder. See `metadata_similarity::rank_by_metadata`.
+    fn start_metasim_scan(&mut self, ctx: &egui::Context) {
+        let Some(input_dir) = self.input_dir.clone() else { return; };
+
+        let anchors: Vec<PathBuf> = self
+            .person_files
+            .iter()
+            .filter(|p| crate::utils::is_image(p))
+            .cloned()
+            .collect();
+        if anchors.is_empty() {
+            self.status_msg =
+                "No confirmed photos (images) in this person's folder to anchor the scan on.".to_string();
+            return;
+        }
+
+        // Photos already confirmed shouldn't also show up as "new" candidates.
+        let exclude: HashSet<PathBuf> = self
+            .person_origins
+            .values()
+            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+
+        self.metasim_scanning = true;
+        self.status_msg = "Scanning input directory for similar timing…".to_string();
+        let window_secs = (self.metasim_window_minutes.max(1.0) as i64) * 60;
+        let tx = self.metasim_tx.clone();
+        let ctx = ctx.clone();
+
+        thread::spawn(move || {
+            let candidates: Vec<PathBuf> = WalkDir::new(&input_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.path().to_path_buf())
+                .filter(|p| crate::utils::is_image(p) || crate::utils::is_video(p))
+                .filter(|p| {
+                    let canon = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                    !exclude.contains(&canon)
+                })
+                .collect();
+
+            let ranked = crate::metadata_similarity::rank_by_metadata(&anchors, candidates, window_secs);
+            let _ = tx.send(MetaSimMessage::Done(ranked));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Copy one metadata-similarity candidate into the target person's
+    /// folder, mirroring the single-image "Create + Copy" flow, and drop it
+    /// from this tab's list once it's confirmed.
+    fn add_metasim_candidate_to_person(&mut self, idx: usize) {
+        let Some(target_dir) = self.target_dir.clone() else { return; };
+        let Some((candidate, _)) = self.metasim_images_cache.get(idx) else { return; };
+        let path = candidate.path.clone();
+        let Some(file_name) = path.file_name() else { return; };
+
+        let destination = get_unique_path(&target_dir, file_name);
+        if std::fs::copy(&path, &destination).is_ok() {
+            if let Some(dest_name) = destination.file_name() {
+                record_origins(&target_dir, &[(dest_name.to_string_lossy().to_string(), path.clone())]);
+            }
+            self.metasim_ranked.retain(|c| c.path != path);
+            self.metasim_images_cache.retain(|(c, _)| c.path != path);
+            self.status_msg = format!(
+                "Added {} to the person folder.",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            self.update_target_count();
+            self.invalidate_person_files();
+        } else {
+            self.status_msg = format!("Could not copy {} to the person folder.", path.display());
+        }
+    }
+
+    /// Candidates ranked by EXIF timestamp/camera/color proximity to photos
+    /// already confirmed in this person's folder — a fallback for photos the
+    /// face pipeline can't see into (covered or turned-away faces).
+    fn show_metadata_similarity_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.ensure_person_files_loaded();
+
+        if self.person_files.is_empty() {
+            ui.label(
+                "Add at least one confirmed photo to this person's folder first (via the Matches tab), then scan here.",
+            );
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Time window:");
+            ui.add(
+                egui::DragValue::new(&mut self.metasim_window_minutes)
+                    .range(1.0..=1440.0)
+                    .suffix(" min"),
+            );
+            ui.add_enabled_ui(!self.metasim_scanning && self.input_dir.is_some(), |ui| {
+                if ui.button("🔎 Scan for Similar Timing").clicked() {
+                    self.start_metasim_scan(ctx);
+                }
+            });
+            if self.metasim_scanning {
+                ui.spinner();
+                ui.label("Scanning…");
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Ranks input-directory photos by how close their timestamp, camera, and color palette \
+                 are to photos already confirmed for this person - useful when their face is covered or \
+                 turned away. Hover a photo for the full breakdown.",
+            )
+            .weak()
+            .size(11.0),
+        );
+
+        if self.metasim_ranked.is_empty() {
+            if !self.metasim_scanning {
+                ui.label("No results yet. Click 'Scan for Similar Timing' above.");
+            }
+            return;
+        }
+
+        let total = self.metasim_ranked.len();
+        let total_pages = self.metasim_total_pages();
+        let page_start = self.metasim_page * self.page_size + 1;
+        let page_end = ((self.metasim_page + 1) * self.page_size).min(total);
+
+        ui.separator();
+        ui.label(format!(
+            "Page {}/{} — {} total candidates, showing {}-{}",
+            self.metasim_page + 1, total_pages, total, page_start, page_end
+        ));
+
+        ui.horizontal(|ui| {
+            let on_first = self.metasim_page == 0;
+            let on_last = self.metasim_page + 1 >= total_pages;
+            if ui.add_enabled(!on_first, egui::Button::new("< Prev")).clicked() {
+                let prev = self.metasim_page - 1;
+                self.load_metasim_page(prev);
+            }
+            if ui.add_enabled(!on_last, egui::Button::new("Next >")).clicked() {
+                let next = self.metasim_page + 1;
+                self.load_metasim_page(next);
+            }
+            ui.label(
+                egui::RichText::new("Hover for details · double-click to open in your photo app · right-click for more")
+                    .weak()
+                    .size(11.0),
+            );
+        });
+
+        self.spawn_thumbnail_loader(ctx, ThumbTarget::MetaSim);
+
+        let mut open_trigger: Option<PathBuf> = None;
+        let mut view_trigger: Option<PathBuf> = None;
+        let mut new_person_trigger: Option<PathBuf> = None;
+        let mut trash_trigger: Option<PathBuf> = None;
+        let mut add_trigger: Option<usize> = None;
+
+        let mut scroll_area = egui::ScrollArea::vertical().id_source("metasim_scroll");
+        if self.metasim_scroll_to_top {
+            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+            self.metasim_scroll_to_top = false;
+        }
+        scroll_area.show(ui, |ui| {
+            let avail = (ui.available_width() - 2.0).max(THUMB_SPACING);
+            let aspects = thumb_aspects(
+                self.metasim_images_cache
+                    .iter()
+                    .map(|(_, texture)| texture.as_ref()),
+            );
+            let rows = pack_thumb_rows(&aspects, self.thumbnail_size, avail);
+
+            ui.spacing_mut().item_spacing = egui::vec2(THUMB_SPACING, THUMB_SPACING);
+            for row in &rows {
+                ui.horizontal(|ui| {
+                    for idx in row.start..row.end {
+                        let (candidate, texture) = &self.metasim_images_cache[idx];
+                        let img_path = &candidate.path;
+                        let size = egui::vec2(aspects[idx] * row.height, row.height);
+                        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+                        if ui.is_rect_visible(rect) {
+                            paint_thumbnail(ui, rect, texture, img_path);
+
+                            let camera_icon = if candidate.same_camera { "📷" } else { "" };
+                            ui.painter().text(
+                                egui::pos2(rect.left() + 3.0, rect.bottom() - 14.0),
+                                egui::Align2::LEFT_TOP,
+                                format!(
+                                    "{:.0}% · Δ{} {}",
+                                    candidate.score.min(1.0) * 100.0,
+                                    crate::metadata_similarity::humanize_delta(candidate.delta_secs),
+                                    camera_icon,
+                                ),
+                                egui::FontId::proportional(10.0),
+                                egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200),
+                            );
+                        }
+
+                        let resp = resp.on_hover_text(candidate.explain());
+
+                        if resp.double_clicked() {
+                            open_trigger = Some(img_path.clone());
+                        }
+
+                        resp.context_menu(|ui| {
+                            if ui.button("📂 Open in Explorer").clicked() {
+                                reveal_in_explorer(img_path);
+                                ui.close_menu();
+                            }
+                            if ui.button("🖼 Open in default app").clicked() {
+                                open_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("🔍 Open in built-in viewer").clicked() {
+                                view_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("➕ Add to Person Folder").clicked() {
+                                add_trigger = Some(idx);
+                                ui.close_menu();
+                            }
+                            if self.people_dir.is_some() {
+                                if ui.button("➕ Create New Person + Add Image").clicked() {
+                                    new_person_trigger = Some(img_path.clone());
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("➕ Create New Person (set people library first)"));
+                            }
+                            ui.separator();
+                            if ui.button("🗑 Move to Recycle Bin").clicked() {
+                                trash_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        if let Some(path) = open_trigger {
+            self.open_in_default_app(&path);
+        }
+
+        if let Some(path) = view_trigger {
+            self.toggle_viewer(ctx, path);
+        }
+
+        if let Some(path) = new_person_trigger {
+            self.new_person_image_path = Some(path);
+            self.new_person_name.clear();
+            self.show_new_person_modal = true;
+        }
+
+        if let Some(idx) = add_trigger {
+            self.add_metasim_candidate_to_person(idx);
+        }
+
+        if let Some(path) = trash_trigger {
+            match trash::delete(&path) {
+                Ok(()) => {
+                    self.metasim_ranked.retain(|c| c.path != path);
+                    self.metasim_images_cache.retain(|(c, _)| c.path != path);
                     if self.viewer.as_ref().map(|v| &v.path) == Some(&path) {
                         self.viewer = None;
                     }

@@ -2,6 +2,7 @@
 
 mod face;
 mod gui;
+mod metadata_similarity;
 mod utils;
 
 #[cfg(target_os = "windows")]
