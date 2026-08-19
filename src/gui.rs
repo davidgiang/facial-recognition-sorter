@@ -15,14 +15,11 @@ use crate::CommandHideExt;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Sidecar file written inside a person folder recording where each copied
-/// photo came from, so the app can reveal the original instead of the copy.
-const ORIGINS_FILE: &str = ".origins.json";
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Matches,
     PersonFolder,
+    MetadataSimilarity,
 }
 
 /// Longest edge a decoded thumbnail keeps. Thumbnails are drawn at most a few
@@ -162,6 +159,7 @@ fn paint_thumbnail(
 enum ThumbTarget {
     Matches,
     Person,
+    MetaSim,
     /// The pop-out viewer, which decodes one photo at a larger size.
     Viewer,
 }
@@ -268,8 +266,18 @@ pub struct FaceSearchApp {
     /// behind can be discarded.
     matches_thumb_gen: Arc<AtomicU64>,
     person_thumb_gen: Arc<AtomicU64>,
-    /// File name inside the person folder -> path the photo was copied from.
-    person_origins: HashMap<String, PathBuf>,
+
+    // "Similar Timing" (metadata-similarity) tab state
+    metasim_window_minutes: f32,
+    metasim_scanning: bool,
+    metasim_ranked: Vec<crate::metadata_similarity::MetaSimCandidate>,
+    metasim_images_cache: Vec<(crate::metadata_similarity::MetaSimCandidate, bool, Option<Result<egui::TextureHandle, String>>)>,
+    metasim_last_selected_index: Option<usize>,
+    show_metasim_copy_confirm: bool,
+    metasim_page: usize,
+    metasim_scroll_to_top: bool,
+    metasim_pending_thumbs: Vec<PathBuf>,
+    metasim_thumb_gen: Arc<AtomicU64>,
 
     // Log history for display during processing
     log_messages: Vec<String>,
@@ -282,6 +290,12 @@ pub struct FaceSearchApp {
     rx: Receiver<UiMessage>,
     thumb_tx: Sender<ThumbResult>,
     thumb_rx: Receiver<ThumbResult>,
+    metasim_tx: Sender<MetaSimMessage>,
+    metasim_rx: Receiver<MetaSimMessage>,
+}
+
+pub enum MetaSimMessage {
+    Done(Vec<crate::metadata_similarity::MetaSimCandidate>),
 }
 
 pub enum UiMessage {
@@ -294,6 +308,7 @@ impl Default for FaceSearchApp {
     fn default() -> Self {
         let (tx, rx) = channel();
         let (thumb_tx, thumb_rx) = channel();
+        let (metasim_tx, metasim_rx) = channel();
         let settings = AppSettings::load();
         let mut people_dir = settings.people_dir.clone();
         let mut selected_person = settings.selected_person.clone();
@@ -347,13 +362,24 @@ impl Default for FaceSearchApp {
             person_pending_thumbs: Vec::new(),
             matches_thumb_gen: Arc::new(AtomicU64::new(0)),
             person_thumb_gen: Arc::new(AtomicU64::new(0)),
-            person_origins: HashMap::new(),
+            metasim_window_minutes: 60.0,
+            metasim_scanning: false,
+            metasim_ranked: Vec::new(),
+            metasim_images_cache: Vec::new(),
+            metasim_last_selected_index: None,
+            show_metasim_copy_confirm: false,
+            metasim_page: 0,
+            metasim_scroll_to_top: false,
+            metasim_pending_thumbs: Vec::new(),
+            metasim_thumb_gen: Arc::new(AtomicU64::new(0)),
             log_messages: Vec::new(),
             scroll_to_top: false,
             tx,
             rx,
             thumb_tx,
             thumb_rx,
+            metasim_tx,
+            metasim_rx,
         }
     }
 }
@@ -376,30 +402,27 @@ fn get_unique_path(dir: &std::path::Path, file_name: &std::ffi::OsStr) -> PathBu
     path
 }
 
-fn origins_file(person_dir: &Path) -> PathBuf {
-    person_dir.join(ORIGINS_FILE)
-}
+/// True if `path`'s contents byte-for-byte match a file already sorted into
+/// the people library. `target_filesizes` groups already-sorted files by size
+/// for a cheap first filter before falling back to a full read - the same
+/// "already seen" check `process_directory` uses for the Matches tab in
+/// `main.rs`, so a photo doesn't get re-suggested once it's been sorted.
+fn is_already_sorted(path: &Path, target_filesizes: &HashMap<u64, Vec<PathBuf>>) -> bool {
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    let Some(candidates) = target_filesizes.get(&size) else { return false; };
+    let Ok(bytes) = fs::read(path) else { return false; };
 
-fn load_origins(person_dir: &Path) -> HashMap<String, PathBuf> {
-    fs::read_to_string(origins_file(person_dir))
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_default()
-}
-
-/// Merge `entries` (destination file name -> source path) into the person
-/// folder's origins sidecar.
-fn record_origins(person_dir: &Path, entries: &[(String, PathBuf)]) {
-    if entries.is_empty() {
-        return;
-    }
-    let mut origins = load_origins(person_dir);
-    for (file_name, source) in entries {
-        origins.insert(file_name.clone(), source.clone());
-    }
-    if let Ok(data) = serde_json::to_string_pretty(&origins) {
-        let _ = fs::write(origins_file(person_dir), data);
-    }
+    let canon_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    candidates.iter().any(|target| {
+        let canon_target = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+        if canon_path == canon_target {
+            return false;
+        }
+        fs::read(target).map(|target_bytes| target_bytes == bytes).unwrap_or(false)
+    })
 }
 
 /// Open Explorer with `path` selected inside its containing folder.
@@ -513,7 +536,7 @@ fn find_original(input_dir: &Path, copy_path: &Path, size: u64) -> Option<PathBu
 /// cached thumbnail, and would otherwise render as an error tile.
 fn ensure_quick_video_thumbnail(video_path: &Path) -> Option<PathBuf> {
     let thumb_path = crate::utils::get_video_thumbnail_path(video_path);
-    if thumb_path.exists() {
+    if crate::utils::video_thumbnail_exists(&thumb_path) {
         return Some(thumb_path);
     }
     let ffmpeg = crate::utils::find_ffmpeg_path()?;
@@ -534,7 +557,7 @@ fn ensure_quick_video_thumbnail(video_path: &Path) -> Option<PathBuf> {
         .status()
         .ok()?;
 
-    (status.success() && thumb_path.exists()).then_some(thumb_path)
+    (status.success() && crate::utils::video_thumbnail_exists(&thumb_path)).then_some(thumb_path)
 }
 
 /// Where a file's downscaled thumbnail is cached. Keyed by path, size and
@@ -776,6 +799,31 @@ impl FaceSearchApp {
         self.person_thumb_gen.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn metasim_total_pages(&self) -> usize {
+        if self.page_size == 0 { return 1; }
+        let total = self.metasim_ranked.len();
+        if total == 0 { return 1; }
+        (total + self.page_size - 1) / self.page_size
+    }
+
+    fn load_metasim_page(&mut self, page: usize) {
+        self.metasim_images_cache.clear();
+        let start = page * self.page_size;
+        let end = (start + self.page_size).min(self.metasim_ranked.len());
+        for candidate in &self.metasim_ranked[start..end] {
+            self.metasim_images_cache.push((candidate.clone(), false, None));
+        }
+        self.metasim_page = page;
+        self.metasim_last_selected_index = None;
+        self.metasim_scroll_to_top = true;
+        self.metasim_pending_thumbs = self
+            .metasim_images_cache
+            .iter()
+            .map(|(candidate, _, _)| candidate.path.clone())
+            .collect();
+        self.metasim_thumb_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Decode a page worth of thumbnails on the rayon pool. Results stream back
     /// through `thumb_rx`, so the grid fills in progressively instead of
     /// blocking the UI thread on every file in turn.
@@ -783,6 +831,7 @@ impl FaceSearchApp {
         let paths = match target {
             ThumbTarget::Matches => std::mem::take(&mut self.matches_pending_thumbs),
             ThumbTarget::Person => std::mem::take(&mut self.person_pending_thumbs),
+            ThumbTarget::MetaSim => std::mem::take(&mut self.metasim_pending_thumbs),
             ThumbTarget::Viewer => Vec::new(),
         };
         if paths.is_empty() {
@@ -792,6 +841,7 @@ impl FaceSearchApp {
         let counter = match target {
             ThumbTarget::Matches => self.matches_thumb_gen.clone(),
             ThumbTarget::Person => self.person_thumb_gen.clone(),
+            ThumbTarget::MetaSim => self.metasim_thumb_gen.clone(),
             ThumbTarget::Viewer => return,
         };
         let generation = counter.load(Ordering::Relaxed);
@@ -821,6 +871,7 @@ impl FaceSearchApp {
             let current = match result.target {
                 ThumbTarget::Matches => self.matches_thumb_gen.load(Ordering::Relaxed),
                 ThumbTarget::Person => self.person_thumb_gen.load(Ordering::Relaxed),
+                ThumbTarget::MetaSim => self.metasim_thumb_gen.load(Ordering::Relaxed),
                 // The viewer holds one photo, so the open path is the only check.
                 ThumbTarget::Viewer => result.generation,
             };
@@ -854,6 +905,13 @@ impl FaceSearchApp {
                         }
                     }
                 }
+                ThumbTarget::MetaSim => {
+                    for entry in self.metasim_images_cache.iter_mut() {
+                        if entry.0.path == result.path && entry.2.is_none() {
+                            entry.2 = Some(texture.clone());
+                        }
+                    }
+                }
                 ThumbTarget::Viewer => {
                     if let Some(viewer) = &mut self.viewer {
                         if viewer.path == result.path {
@@ -872,7 +930,6 @@ impl FaceSearchApp {
         self.person_files_loaded = false;
         self.person_files.clear();
         self.person_images_cache.clear();
-        self.person_origins.clear();
         self.person_page = 0;
         self.viewer = None;
         self.person_pending_thumbs.clear();
@@ -881,7 +938,6 @@ impl FaceSearchApp {
 
     fn refresh_person_files(&mut self) {
         self.person_files.clear();
-        self.person_origins.clear();
         self.person_files_loaded = true;
 
         let Some(dir) = self.target_dir.clone() else {
@@ -904,8 +960,6 @@ impl FaceSearchApp {
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default()
         });
-        self.person_origins = load_origins(&dir);
-
         self.update_target_count();
         let page = self.person_page.min(self.person_total_pages() - 1);
         self.load_person_page(page);
@@ -1060,22 +1114,12 @@ impl FaceSearchApp {
     }
 
     /// Reveal a photo from the person folder at the location it was copied
-    /// from. When no origin was recorded (photos copied before origin tracking
-    /// existed, or added by hand) the input directory is searched for the
-    /// source file.
+    /// from, by searching the input directory for a matching source file.
     fn reveal_original_location(&mut self, copy_path: &Path) {
         let file_name = copy_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-
-        if let Some(origin) = self.person_origins.get(&file_name) {
-            if origin.exists() {
-                reveal_in_explorer(origin);
-                self.status_msg = format!("Opened original location: {}", origin.display());
-                return;
-            }
-        }
 
         let Some(input) = self.input_dir.clone() else {
             reveal_in_explorer(copy_path);
@@ -1289,6 +1333,22 @@ impl eframe::App for FaceSearchApp {
                     self.is_processing = false;
                     self.log_messages.clear();
                     self.status_msg = format!("Error: {}", err);
+                }
+            }
+        }
+
+        while let Ok(msg) = self.metasim_rx.try_recv() {
+            match msg {
+                MetaSimMessage::Done(ranked) => {
+                    self.metasim_scanning = false;
+                    let total = ranked.len();
+                    self.metasim_ranked = ranked;
+                    self.load_metasim_page(0);
+                    if total > 0 {
+                        self.status_msg = format!("Found {} candidates by timing/camera/color similarity.", total);
+                    } else {
+                        self.status_msg = "No candidates found within the time window.".to_string();
+                    }
                 }
             }
         }
@@ -1629,24 +1689,16 @@ impl eframe::App for FaceSearchApp {
                 if do_copy {
                     let target_dest = self.target_dir.clone().unwrap();
                     let mut copy_count = 0;
-                    let mut origins: Vec<(String, PathBuf)> = Vec::new();
                     for (path, _, selected, _) in &self.matched_images_cache {
                         if *selected {
                             if let Some(file_name) = path.file_name() {
                                 let destination = get_unique_path(&target_dest, file_name);
                                 if std::fs::copy(path, &destination).is_ok() {
                                     copy_count += 1;
-                                    if let Some(dest_name) = destination.file_name() {
-                                        origins.push((
-                                            dest_name.to_string_lossy().to_string(),
-                                            path.clone(),
-                                        ));
-                                    }
                                 }
                             }
                         }
                     }
-                    record_origins(&target_dest, &origins);
 
                     // Remove copied items from master ranked list
                     let removed: HashSet<PathBuf> = self.matched_images_cache.iter()
@@ -1668,6 +1720,108 @@ impl eframe::App for FaceSearchApp {
                 }
                 if do_cancel {
                     self.show_copy_confirm = false;
+                }
+            }
+
+            // --- Similar Timing Copy Confirmation Modal ---
+            if self.show_metasim_copy_confirm {
+                let selected_indices: Vec<usize> = self.metasim_images_cache.iter()
+                    .enumerate()
+                    .filter(|(_, (_, s, _))| *s)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                let mut do_copy = false;
+                let mut do_cancel = false;
+
+                egui::Window::new("Confirm Copy")
+                    .collapsible(false)
+                    .resizable(true)
+                    .default_size([600.0, 450.0])
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.heading(format!("Copy {} selected photo(s) to the selected person folder?", selected_indices.len()));
+                        ui.separator();
+
+                        let cell_size = 100.0_f32;
+                        let available_w = ui.available_width();
+                        let cols = ((available_w / cell_size).floor() as usize).max(1);
+
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            egui::Grid::new("metasim_confirm_preview_grid")
+                                .num_columns(cols)
+                                .spacing([4.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (col_i, &idx) in selected_indices.iter().enumerate() {
+                                        let (candidate, _, texture_res_opt) = &self.metasim_images_cache[idx];
+                                        match texture_res_opt {
+                                            Some(Ok(texture)) => {
+                                                let image = egui::Image::new(&*texture)
+                                                    .fit_to_exact_size(egui::vec2(88.0, 88.0))
+                                                    .maintain_aspect_ratio(true);
+                                                ui.add(image);
+                                            }
+                                            Some(Err(_)) => {
+                                                ui.add_sized([88.0, 88.0], egui::Label::new("⚠ Error"));
+                                            }
+                                            None => {
+                                                ui.add_sized([88.0, 88.0], egui::Label::new(candidate.path.file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    .unwrap_or_default()));
+                                            }
+                                        }
+                                        if (col_i + 1) % cols == 0 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                        });
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("✔ Confirm Copy").color(egui::Color32::from_rgb(80, 200, 100))).clicked() {
+                                do_copy = true;
+                            }
+                            ui.add_space(12.0);
+                            if ui.button(egui::RichText::new("✖ Cancel").color(egui::Color32::from_rgb(220, 80, 80))).clicked() {
+                                do_cancel = true;
+                            }
+                        });
+                    });
+
+                if do_copy {
+                    let target_dest = self.target_dir.clone().unwrap();
+                    let mut copy_count = 0;
+                    for (candidate, selected, _) in &self.metasim_images_cache {
+                        if *selected {
+                            let path = &candidate.path;
+                            if let Some(file_name) = path.file_name() {
+                                let destination = get_unique_path(&target_dest, file_name);
+                                if std::fs::copy(path, &destination).is_ok() {
+                                    copy_count += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    let removed: HashSet<PathBuf> = self.metasim_images_cache.iter()
+                        .filter(|(_, s, _)| *s)
+                        .map(|(c, ..)| c.path.clone())
+                        .collect();
+                    self.metasim_ranked.retain(|c| !removed.contains(&c.path));
+                    self.metasim_images_cache.retain(|(c, ..)| !removed.contains(&c.path));
+
+                    let max_page = if self.metasim_ranked.is_empty() { 0 } else { self.metasim_total_pages() - 1 };
+                    let reload_page = self.metasim_page.min(max_page);
+                    self.load_metasim_page(reload_page);
+
+                    self.status_msg = format!("Successfully copied {} images to the selected person folder!", copy_count);
+                    self.update_target_count();
+                    self.invalidate_person_files();
+                    self.show_metasim_copy_confirm = false;
+                }
+                if do_cancel {
+                    self.show_metasim_copy_confirm = false;
                 }
             }
 
@@ -1797,12 +1951,6 @@ impl eframe::App for FaceSearchApp {
                         if let Some(file_name) = img_path.file_name() {
                             let dest = get_unique_path(&person_dir, file_name);
                             if std::fs::copy(img_path, &dest).is_ok() {
-                                if let Some(dest_name) = dest.file_name() {
-                                    record_origins(
-                                        &person_dir,
-                                        &[(dest_name.to_string_lossy().to_string(), img_path.clone())],
-                                    );
-                                }
                                 self.status_msg = format!(
                                     "Created '{}' and copied image.",
                                     self.new_person_name.trim()
@@ -1855,13 +2003,17 @@ impl eframe::App for FaceSearchApp {
                         "👤 Person Folder ({})",
                         self.target_image_count + self.target_video_count
                     );
+                    let metasim_label =
+                        format!("🕒 Similar Timing ({})", self.metasim_ranked.len());
                     ui.selectable_value(&mut self.active_tab, Tab::Matches, matches_label);
                     ui.selectable_value(&mut self.active_tab, Tab::PersonFolder, person_label);
+                    ui.selectable_value(&mut self.active_tab, Tab::MetadataSimilarity, metasim_label);
                 });
 
                 match self.active_tab {
                     Tab::Matches => self.show_matches_tab(ui, ctx),
                     Tab::PersonFolder => self.show_person_tab(ui, ctx),
+                    Tab::MetadataSimilarity => self.show_metadata_similarity_tab(ui, ctx),
                 }
             }
         });
@@ -1911,7 +2063,6 @@ impl FaceSearchApp {
         self.spawn_thumbnail_loader(ctx, ThumbTarget::Matches);
 
         let mut clicked_idx: Option<usize> = None;
-        let mut undo_select: Option<usize> = None;
         let mut new_person_trigger: Option<PathBuf> = None;
         let mut trash_trigger: Option<PathBuf> = None;
         let mut view_trigger: Option<PathBuf> = None;
@@ -1965,13 +2116,13 @@ impl FaceSearchApp {
                             );
                         }
 
-                        if resp.double_clicked() {
-                            open_trigger = Some(img_path.clone());
-                            // The first half of the double-click already toggled
-                            // selection; enlarging a photo should not change what
-                            // is staged for copying.
-                            undo_select = Some(idx);
-                        } else if resp.clicked() {
+                        let resp = if let Some(Err(err)) = texture {
+                            resp.on_hover_text(format!("⚠ Could not preview this file: {}", err))
+                        } else {
+                            resp
+                        };
+
+                        if resp.clicked() {
                             clicked_idx = Some(idx);
                         }
 
@@ -2026,15 +2177,6 @@ impl FaceSearchApp {
             self.last_selected_index = Some(idx);
         }
 
-        // Shift-click toggles a whole range, which is not ours to undo.
-        if let Some(idx) = undo_select {
-            if !ctx.input(|i| i.modifiers.shift) {
-                if let Some(entry) = self.matched_images_cache.get_mut(idx) {
-                    entry.2 = !entry.2;
-                }
-            }
-        }
-
         if let Some(path) = open_trigger {
             self.open_in_default_app(&path);
         }
@@ -2055,6 +2197,312 @@ impl FaceSearchApp {
                 Ok(()) => {
                     self.all_ranked_matches.retain(|(p, _)| p != &path);
                     self.matched_images_cache.retain(|(p, ..)| p != &path);
+                    if self.viewer.as_ref().map(|v| &v.path) == Some(&path) {
+                        self.viewer = None;
+                    }
+                    self.status_msg = format!(
+                        "Moved {} to the Recycle Bin.",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                Err(e) => {
+                    self.status_msg = format!("Could not move {} to the Recycle Bin: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
+    /// Kick off a background scan ranking every photo in the input directory
+    /// by EXIF timestamp/camera/color proximity to the confirmed photos
+    /// already in this person's folder. See `metadata_similarity::rank_by_metadata`.
+    fn start_metasim_scan(&mut self, ctx: &egui::Context) {
+        let Some(input_dir) = self.input_dir.clone() else { return; };
+
+        let anchors: Vec<PathBuf> = self.person_files.clone();
+        if anchors.is_empty() {
+            self.status_msg =
+                "No confirmed photos in this person's folder to anchor the scan on.".to_string();
+            return;
+        }
+
+        let people_dir = self.people_dir.clone();
+        self.metasim_scanning = true;
+        self.status_msg = "Scanning input directory for similar timing…".to_string();
+        let window_secs = (self.metasim_window_minutes.max(1.0) as i64) * 60;
+        let tx = self.metasim_tx.clone();
+        let ctx = ctx.clone();
+
+        thread::spawn(move || {
+            // Photos already sorted into *any* person's folder shouldn't show up
+            // as "new" candidates. Mirrors the "already seen" dedup
+            // `process_directory` uses for the Matches tab (main.rs): a
+            // byte-content comparison against everything already sitting in the
+            // people library, not just what the `.origins.json` sidecar happens
+            // to have recorded - this also catches photos added to a person
+            // folder outside this app, and copies that end up back in view
+            // because `target_dir` is nested inside `input_dir`.
+            //
+            // Built here on the background thread, not the click handler, so a
+            // large people library doesn't freeze the UI before scanning even
+            // shows as in progress.
+            let mut target_filesizes: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+            if let Some(people_dir) = &people_dir {
+                for entry in WalkDir::new(people_dir).into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_file() && (crate::utils::is_image(path) || crate::utils::is_video(path)) {
+                        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        target_filesizes.entry(size).or_default().push(path.to_path_buf());
+                    }
+                }
+            }
+
+            let walked: Vec<PathBuf> = WalkDir::new(&input_dir)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.path().to_path_buf())
+                .filter(|p| crate::utils::is_image(p) || crate::utils::is_video(p))
+                .collect();
+
+            // `is_already_sorted` reads whole files on a size collision, so run
+            // it in parallel rather than one file at a time.
+            let candidates: Vec<PathBuf> = walked
+                .into_par_iter()
+                .filter(|p| !is_already_sorted(p, &target_filesizes))
+                .collect();
+
+            let ranked = crate::metadata_similarity::rank_by_metadata(&anchors, candidates, window_secs);
+            let _ = tx.send(MetaSimMessage::Done(ranked));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Candidates ranked by timestamp/camera/GPS/filename-sequence proximity
+    /// to photos already confirmed in this person's folder — a fallback for
+    /// photos the face pipeline can't see into (covered or turned-away faces).
+    fn show_metadata_similarity_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.ensure_person_files_loaded();
+
+        if self.person_files.is_empty() {
+            ui.label(
+                "Add at least one confirmed photo to this person's folder first (via the Matches tab), then scan here.",
+            );
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Time window:");
+            ui.add(
+                egui::DragValue::new(&mut self.metasim_window_minutes)
+                    .range(1.0..=1440.0)
+                    .suffix(" min"),
+            );
+            ui.add_enabled_ui(!self.metasim_scanning && self.input_dir.is_some(), |ui| {
+                if ui.button("🔎 Scan for Similar Timing").clicked() {
+                    self.start_metasim_scan(ctx);
+                }
+            });
+            if self.metasim_scanning {
+                ui.spinner();
+                ui.label("Scanning…");
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Ranks input-directory photos by how close their timestamp, camera, GPS location, and \
+                 filename sequence number are to photos already confirmed for this person - useful when \
+                 their face is covered or turned away. Hover a photo for the full breakdown.",
+            )
+            .weak()
+            .size(11.0),
+        );
+
+        if self.metasim_ranked.is_empty() {
+            if !self.metasim_scanning {
+                ui.label("No results yet. Click 'Scan for Similar Timing' above.");
+            }
+            return;
+        }
+
+        let total = self.metasim_ranked.len();
+        let total_pages = self.metasim_total_pages();
+        let page_start = self.metasim_page * self.page_size + 1;
+        let page_end = ((self.metasim_page + 1) * self.page_size).min(total);
+        let selected_count = self.metasim_images_cache.iter().filter(|(_, s, _)| *s).count();
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Page {}/{} — {} total candidates, showing {}-{} ({} selected on this page)",
+                self.metasim_page + 1, total_pages, total, page_start, page_end, selected_count
+            ));
+            if selected_count > 0 {
+                if ui.button(format!("Copy {} Selected to Person Folder", selected_count)).clicked() {
+                    self.show_metasim_copy_confirm = true;
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            let on_first = self.metasim_page == 0;
+            let on_last = self.metasim_page + 1 >= total_pages;
+            if ui.add_enabled(!on_first, egui::Button::new("< Prev")).clicked() {
+                let prev = self.metasim_page - 1;
+                self.load_metasim_page(prev);
+            }
+            if ui.add_enabled(!on_last, egui::Button::new("Next >")).clicked() {
+                let next = self.metasim_page + 1;
+                self.load_metasim_page(next);
+            }
+            ui.label(
+                egui::RichText::new("Click to select · double-click to open in your photo app · right-click for more")
+                    .weak()
+                    .size(11.0),
+            );
+        });
+
+        self.spawn_thumbnail_loader(ctx, ThumbTarget::MetaSim);
+
+        let mut clicked_idx: Option<usize> = None;
+        let mut open_trigger: Option<PathBuf> = None;
+        let mut view_trigger: Option<PathBuf> = None;
+        let mut new_person_trigger: Option<PathBuf> = None;
+        let mut trash_trigger: Option<PathBuf> = None;
+
+        let mut scroll_area = egui::ScrollArea::vertical().id_source("metasim_scroll");
+        if self.metasim_scroll_to_top {
+            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+            self.metasim_scroll_to_top = false;
+        }
+        scroll_area.show(ui, |ui| {
+            let avail = (ui.available_width() - 2.0).max(THUMB_SPACING);
+            let aspects = thumb_aspects(
+                self.metasim_images_cache
+                    .iter()
+                    .map(|(_, _, texture)| texture.as_ref()),
+            );
+            let rows = pack_thumb_rows(&aspects, self.thumbnail_size, avail);
+
+            ui.spacing_mut().item_spacing = egui::vec2(THUMB_SPACING, THUMB_SPACING);
+            for row in &rows {
+                ui.horizontal(|ui| {
+                    for idx in row.start..row.end {
+                        let (candidate, selected, texture) = &self.metasim_images_cache[idx];
+                        let img_path = &candidate.path;
+                        let size = egui::vec2(aspects[idx] * row.height, row.height);
+                        let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+
+                        if ui.is_rect_visible(rect) {
+                            paint_thumbnail(ui, rect, texture, img_path);
+
+                            if *selected {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    4.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 150, 255, 60),
+                                );
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 150, 255)),
+                                );
+                            }
+
+                            let camera_icon = if candidate.same_camera { "📷" } else { "" };
+                            ui.painter().text(
+                                egui::pos2(rect.left() + 3.0, rect.bottom() - 14.0),
+                                egui::Align2::LEFT_TOP,
+                                format!(
+                                    "{:.0}% · Δ{} {}",
+                                    candidate.score.min(1.0) * 100.0,
+                                    crate::metadata_similarity::humanize_delta(candidate.delta_secs),
+                                    camera_icon,
+                                ),
+                                egui::FontId::proportional(10.0),
+                                egui::Color32::from_rgba_unmultiplied(220, 220, 220, 200),
+                            );
+                        }
+
+                        let hover = match texture {
+                            Some(Err(err)) => format!("⚠ Could not preview this file: {}\n\n{}", err, candidate.explain()),
+                            _ => candidate.explain(),
+                        };
+                        let resp = resp.on_hover_text(hover);
+
+                        if resp.clicked() {
+                            clicked_idx = Some(idx);
+                        }
+
+                        resp.context_menu(|ui| {
+                            if ui.button("📂 Open in Explorer").clicked() {
+                                reveal_in_explorer(img_path);
+                                ui.close_menu();
+                            }
+                            if ui.button("🖼 Open in default app").clicked() {
+                                open_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("🔍 Open in built-in viewer").clicked() {
+                                view_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if self.people_dir.is_some() {
+                                if ui.button("➕ Create New Person + Add Image").clicked() {
+                                    new_person_trigger = Some(img_path.clone());
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new("➕ Create New Person (set people library first)"));
+                            }
+                            ui.separator();
+                            if ui.button("🗑 Move to Recycle Bin").clicked() {
+                                trash_trigger = Some(img_path.clone());
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        // Process shift-click logic outside the grid
+        if let Some(idx) = clicked_idx {
+            if ctx.input(|i| i.modifiers.shift) {
+                if let Some(last_idx) = self.metasim_last_selected_index {
+                    let min_idx = std::cmp::min(last_idx, idx);
+                    let max_idx = std::cmp::max(last_idx, idx);
+                    let current_selection_state = self.metasim_images_cache[idx].1;
+
+                    for i in min_idx..=max_idx {
+                        self.metasim_images_cache[i].1 = !current_selection_state;
+                    }
+                }
+            } else {
+                self.metasim_images_cache[idx].1 = !self.metasim_images_cache[idx].1;
+            }
+            self.metasim_last_selected_index = Some(idx);
+        }
+
+        if let Some(path) = open_trigger {
+            self.open_in_default_app(&path);
+        }
+
+        if let Some(path) = view_trigger {
+            self.toggle_viewer(ctx, path);
+        }
+
+        if let Some(path) = new_person_trigger {
+            self.new_person_image_path = Some(path);
+            self.new_person_name.clear();
+            self.show_new_person_modal = true;
+        }
+
+        if let Some(path) = trash_trigger {
+            match trash::delete(&path) {
+                Ok(()) => {
+                    self.metasim_ranked.retain(|c| c.path != path);
+                    self.metasim_images_cache.retain(|(c, ..)| c.path != path);
                     if self.viewer.as_ref().map(|v| &v.path) == Some(&path) {
                         self.viewer = None;
                     }
@@ -2153,21 +2601,17 @@ impl FaceSearchApp {
                             paint_thumbnail(ui, rect, texture, path);
                         }
 
-                        if resp.clicked() {
-                            open_trigger = Some(path.clone());
-                        }
-
                         let file_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let hover = match self.person_origins.get(&file_name) {
-                            Some(origin) => format!("{}\nOriginal: {}", file_name, origin.display()),
-                            None => format!(
-                                "{}\nOriginal location not recorded — the input directory will be searched for it.",
-                                file_name
-                            ),
-                        };
+                        let mut hover = format!(
+                            "{}\nRight-click \u{2192} \"Open in Explorer (original location)\" to search the input directory for where this came from.",
+                            file_name
+                        );
+                        if let Some(Err(err)) = texture {
+                            hover = format!("⚠ Could not preview this file: {}\n\n{}", err, hover);
+                        }
 
                         resp.on_hover_text(hover).context_menu(|ui| {
                             if ui.button("📂 Open in Explorer (original location)").clicked() {
@@ -2340,25 +2784,6 @@ mod tests {
         write(&dir.join("a_1.jpg"), "two");
         let second = get_unique_path(&dir, std::ffi::OsStr::new("a.jpg"));
         assert_eq!(second.file_name().unwrap(), "a_2.jpg");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn origins_round_trip_and_merge() {
-        let dir = scratch("origins");
-        assert!(load_origins(&dir).is_empty());
-
-        record_origins(&dir, &[("a.jpg".to_string(), PathBuf::from(r"D:\photos\a.jpg"))]);
-        record_origins(&dir, &[("b.jpg".to_string(), PathBuf::from(r"D:\photos\trip\b.jpg"))]);
-
-        let origins = load_origins(&dir);
-        assert_eq!(origins.len(), 2);
-        assert_eq!(origins["a.jpg"], PathBuf::from(r"D:\photos\a.jpg"));
-        assert_eq!(origins["b.jpg"], PathBuf::from(r"D:\photos\trip\b.jpg"));
-
-        // The sidecar is not an image, so it never shows up as a person photo.
-        assert!(!crate::utils::is_image(&origins_file(&dir)));
 
         fs::remove_dir_all(&dir).unwrap();
     }

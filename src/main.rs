@@ -2,6 +2,7 @@
 
 mod face;
 mod gui;
+mod metadata_similarity;
 mod utils;
 
 #[cfg(target_os = "windows")]
@@ -165,7 +166,7 @@ fn ensure_video_thumbnail(
     detector: &FaceDetector,
 ) -> anyhow::Result<PathBuf> {
     let thumb_path = crate::utils::get_video_thumbnail_path(video_path);
-    if thumb_path.exists() {
+    if crate::utils::video_thumbnail_exists(&thumb_path) {
         return Ok(thumb_path);
     }
 
@@ -214,14 +215,16 @@ fn ensure_video_thumbnail(
             } else if let Some(first) = frames.first() {
                 let _ = std::fs::create_dir_all(thumb_path.parent().unwrap());
                 let _ = std::fs::copy(first, &thumb_path);
-            } else {
-                 let _ = std::fs::create_dir_all(thumb_path.parent().unwrap());
-                 let _ = std::fs::File::create(&thumb_path);
             }
+            // No frame could be extracted at all: leave no file behind rather
+            // than writing an empty placeholder. An empty file would still
+            // satisfy an `exists()` check forever, permanently masking this
+            // video from ever being retried while also failing to decode
+            // every time something tries to actually show it.
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
-        
-        if thumb_path.exists() {
+
+        if crate::utils::video_thumbnail_exists(&thumb_path) {
             return Ok(thumb_path);
         }
     }
@@ -598,7 +601,7 @@ pub fn process_directory(
         } else if is_video {
             // Smart Backfill: If video is in DB but missing thumbnail, re-process it
             let thumb_path = crate::utils::get_video_thumbnail_path(&p);
-            if !thumb_path.exists() {
+            if !crate::utils::video_thumbnail_exists(&thumb_path) {
                 videos_to_process.push(p);
                 backfill_count += 1;
             }
@@ -635,27 +638,17 @@ pub fn process_directory(
 
         std::thread::scope(|s| {
             // --- Producer thread: parallel decode + preprocess on CPU ---
-            let db_arc3 = Arc::clone(&db_arc);
             s.spawn(move || {
                 for (batch_idx, batch) in batches.into_iter().enumerate() {
-                    // Record files that fail to decode so they aren't retried every run
-                    let failed_paths: Vec<String> = batch
-                        .par_iter()
-                        .filter_map(|path| {
-                            match crate::utils::load_image_robustly(path) {
-                                Ok(_) => None,
-                                Err(_) => Some(path.to_string_lossy().to_string()),
-                            }
-                        })
-                        .collect();
-
-                    if !failed_paths.is_empty() {
-                        let mut db_guard = db_arc3.lock().unwrap();
-                        for path in failed_paths {
-                            db_guard.images.entry(path).or_insert_with(Vec::new);
-                        }
-                    }
-
+                    // Files that fail to decode are deliberately left out of
+                    // `db.images` entirely (not recorded as a 0-face entry),
+                    // unlike a successful decode that genuinely found no
+                    // faces. Both would otherwise look identical in the
+                    // database, and treating a decode failure as permanent
+                    // would silently hide files a future decoder fix (or a
+                    // sync tool finishing a download, etc.) could resolve -
+                    // leaving them out means they're simply retried, cheaply,
+                    // on the next scan instead of being stuck forever.
                     let decoded: DecodedBatch = batch
                         .par_iter()
                         .filter_map(|path| {

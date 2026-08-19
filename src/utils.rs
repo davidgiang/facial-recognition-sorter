@@ -77,9 +77,25 @@ fn decode_raw(path: &Path) -> anyhow::Result<image::DynamicImage> {
 }
 
 pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
-    // Try standard image crate first (jpg, png, gif, webp, tiff, ...)
-    if let Ok(img) = image::open(path) {
-        return Ok(img);
+    // Try standard image crate first (jpg, png, gif, webp, tiff, ...). Its
+    // error is kept (not discarded) so a final failure below can report the
+    // real reason instead of a generic "could not decode".
+    let standard_err = match image::open(path) {
+        Ok(img) => return Ok(img),
+        Err(e) => e,
+    };
+
+    // `image::open` picks its decoder purely from the file extension, so a
+    // real photo saved/exported/renamed with the "wrong" extension (a valid,
+    // viewable image whose actual format doesn't match its suffix) fails the
+    // signature check immediately. Re-try letting the decoder sniff the real
+    // format from the file's own header bytes instead of trusting the name.
+    if let Ok(reader) = image::ImageReader::open(path) {
+        if let Ok(guessed) = reader.with_guessed_format() {
+            if let Ok(img) = guessed.decode() {
+                return Ok(img);
+            }
+        }
     }
 
     let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
@@ -91,9 +107,14 @@ pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
         }
     }
 
-    // Fallback to ffmpeg for HEIC/AVIF and for RAW the raw pipeline couldn't
-    // handle (e.g. Nikon NEF, which ffmpeg decodes but imagepipe does not).
-    if matches!(ext.as_str(), "heic" | "avif") || is_raw(&ext) {
+    // Last resort: ffmpeg's decoders are far more lenient than the `image`
+    // crate's (e.g. `zune-jpeg`, our default JPEG decoder, can reject a real,
+    // viewable JPEG that every other photo viewer opens fine - the same
+    // class of issue as image::open's PNG signature check rejecting a
+    // mislabeled-but-valid file above). Not gated to specific extensions:
+    // any format ffmpeg understands is worth trying once the two attempts
+    // above have both failed.
+    {
         if let Some(ffmpeg_cmd) = find_ffmpeg_path() {
             let output = Command::new(&ffmpeg_cmd)
                 .hide_window()
@@ -112,7 +133,7 @@ pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
         }
     }
 
-    anyhow::bail!("Could not decode image: {}", path.display())
+    Err(anyhow::anyhow!("Could not decode image {}: {}", path.display(), standard_err))
 }
 
 pub fn get_video_thumbnail_path(video_path: &Path) -> PathBuf {
@@ -127,4 +148,13 @@ pub fn get_video_thumbnail_path(video_path: &Path) -> PathBuf {
     let hash = hasher.finish();
     
     crate::get_app_data_dir().join("output").join("thumbnails").join(format!("{:x}.jpg", hash))
+}
+
+/// A cached video thumbnail only counts if it's a real, non-empty file. A
+/// 0-byte placeholder can be left behind when frame extraction found nothing
+/// to save; treating that the same as "file exists" makes it a permanent,
+/// silently-broken thumbnail that fails to decode forever instead of being
+/// regenerated.
+pub fn video_thumbnail_exists(thumb_path: &Path) -> bool {
+    std::fs::metadata(thumb_path).map(|m| m.len() > 0).unwrap_or(false)
 }
