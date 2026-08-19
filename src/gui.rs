@@ -15,10 +15,6 @@ use crate::CommandHideExt;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Sidecar file written inside a person folder recording where each copied
-/// photo came from, so the app can reveal the original instead of the copy.
-const ORIGINS_FILE: &str = ".origins.json";
-
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Matches,
@@ -270,8 +266,6 @@ pub struct FaceSearchApp {
     /// behind can be discarded.
     matches_thumb_gen: Arc<AtomicU64>,
     person_thumb_gen: Arc<AtomicU64>,
-    /// File name inside the person folder -> path the photo was copied from.
-    person_origins: HashMap<String, PathBuf>,
 
     // "Similar Timing" (metadata-similarity) tab state
     metasim_window_minutes: f32,
@@ -368,7 +362,6 @@ impl Default for FaceSearchApp {
             person_pending_thumbs: Vec::new(),
             matches_thumb_gen: Arc::new(AtomicU64::new(0)),
             person_thumb_gen: Arc::new(AtomicU64::new(0)),
-            person_origins: HashMap::new(),
             metasim_window_minutes: 60.0,
             metasim_scanning: false,
             metasim_ranked: Vec::new(),
@@ -407,32 +400,6 @@ fn get_unique_path(dir: &std::path::Path, file_name: &std::ffi::OsStr) -> PathBu
         counter += 1;
     }
     path
-}
-
-fn origins_file(person_dir: &Path) -> PathBuf {
-    person_dir.join(ORIGINS_FILE)
-}
-
-fn load_origins(person_dir: &Path) -> HashMap<String, PathBuf> {
-    fs::read_to_string(origins_file(person_dir))
-        .ok()
-        .and_then(|data| serde_json::from_str(&data).ok())
-        .unwrap_or_default()
-}
-
-/// Merge `entries` (destination file name -> source path) into the person
-/// folder's origins sidecar.
-fn record_origins(person_dir: &Path, entries: &[(String, PathBuf)]) {
-    if entries.is_empty() {
-        return;
-    }
-    let mut origins = load_origins(person_dir);
-    for (file_name, source) in entries {
-        origins.insert(file_name.clone(), source.clone());
-    }
-    if let Ok(data) = serde_json::to_string_pretty(&origins) {
-        let _ = fs::write(origins_file(person_dir), data);
-    }
 }
 
 /// True if `path`'s contents byte-for-byte match a file already sorted into
@@ -963,7 +930,6 @@ impl FaceSearchApp {
         self.person_files_loaded = false;
         self.person_files.clear();
         self.person_images_cache.clear();
-        self.person_origins.clear();
         self.person_page = 0;
         self.viewer = None;
         self.person_pending_thumbs.clear();
@@ -972,7 +938,6 @@ impl FaceSearchApp {
 
     fn refresh_person_files(&mut self) {
         self.person_files.clear();
-        self.person_origins.clear();
         self.person_files_loaded = true;
 
         let Some(dir) = self.target_dir.clone() else {
@@ -995,8 +960,6 @@ impl FaceSearchApp {
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default()
         });
-        self.person_origins = load_origins(&dir);
-
         self.update_target_count();
         let page = self.person_page.min(self.person_total_pages() - 1);
         self.load_person_page(page);
@@ -1151,22 +1114,12 @@ impl FaceSearchApp {
     }
 
     /// Reveal a photo from the person folder at the location it was copied
-    /// from. When no origin was recorded (photos copied before origin tracking
-    /// existed, or added by hand) the input directory is searched for the
-    /// source file.
+    /// from, by searching the input directory for a matching source file.
     fn reveal_original_location(&mut self, copy_path: &Path) {
         let file_name = copy_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-
-        if let Some(origin) = self.person_origins.get(&file_name) {
-            if origin.exists() {
-                reveal_in_explorer(origin);
-                self.status_msg = format!("Opened original location: {}", origin.display());
-                return;
-            }
-        }
 
         let Some(input) = self.input_dir.clone() else {
             reveal_in_explorer(copy_path);
@@ -1736,24 +1689,16 @@ impl eframe::App for FaceSearchApp {
                 if do_copy {
                     let target_dest = self.target_dir.clone().unwrap();
                     let mut copy_count = 0;
-                    let mut origins: Vec<(String, PathBuf)> = Vec::new();
                     for (path, _, selected, _) in &self.matched_images_cache {
                         if *selected {
                             if let Some(file_name) = path.file_name() {
                                 let destination = get_unique_path(&target_dest, file_name);
                                 if std::fs::copy(path, &destination).is_ok() {
                                     copy_count += 1;
-                                    if let Some(dest_name) = destination.file_name() {
-                                        origins.push((
-                                            dest_name.to_string_lossy().to_string(),
-                                            path.clone(),
-                                        ));
-                                    }
                                 }
                             }
                         }
                     }
-                    record_origins(&target_dest, &origins);
 
                     // Remove copied items from master ranked list
                     let removed: HashSet<PathBuf> = self.matched_images_cache.iter()
@@ -1847,7 +1792,6 @@ impl eframe::App for FaceSearchApp {
                 if do_copy {
                     let target_dest = self.target_dir.clone().unwrap();
                     let mut copy_count = 0;
-                    let mut origins: Vec<(String, PathBuf)> = Vec::new();
                     for (candidate, selected, _) in &self.metasim_images_cache {
                         if *selected {
                             let path = &candidate.path;
@@ -1855,17 +1799,10 @@ impl eframe::App for FaceSearchApp {
                                 let destination = get_unique_path(&target_dest, file_name);
                                 if std::fs::copy(path, &destination).is_ok() {
                                     copy_count += 1;
-                                    if let Some(dest_name) = destination.file_name() {
-                                        origins.push((
-                                            dest_name.to_string_lossy().to_string(),
-                                            path.clone(),
-                                        ));
-                                    }
                                 }
                             }
                         }
                     }
-                    record_origins(&target_dest, &origins);
 
                     let removed: HashSet<PathBuf> = self.metasim_images_cache.iter()
                         .filter(|(_, s, _)| *s)
@@ -2014,12 +1951,6 @@ impl eframe::App for FaceSearchApp {
                         if let Some(file_name) = img_path.file_name() {
                             let dest = get_unique_path(&person_dir, file_name);
                             if std::fs::copy(img_path, &dest).is_ok() {
-                                if let Some(dest_name) = dest.file_name() {
-                                    record_origins(
-                                        &person_dir,
-                                        &[(dest_name.to_string_lossy().to_string(), img_path.clone())],
-                                    );
-                                }
                                 self.status_msg = format!(
                                     "Created '{}' and copied image.",
                                     self.new_person_name.trim()
@@ -2132,7 +2063,6 @@ impl FaceSearchApp {
         self.spawn_thumbnail_loader(ctx, ThumbTarget::Matches);
 
         let mut clicked_idx: Option<usize> = None;
-        let mut undo_select: Option<usize> = None;
         let mut new_person_trigger: Option<PathBuf> = None;
         let mut trash_trigger: Option<PathBuf> = None;
         let mut view_trigger: Option<PathBuf> = None;
@@ -2192,13 +2122,7 @@ impl FaceSearchApp {
                             resp
                         };
 
-                        if resp.double_clicked() {
-                            open_trigger = Some(img_path.clone());
-                            // The first half of the double-click already toggled
-                            // selection; enlarging a photo should not change what
-                            // is staged for copying.
-                            undo_select = Some(idx);
-                        } else if resp.clicked() {
+                        if resp.clicked() {
                             clicked_idx = Some(idx);
                         }
 
@@ -2251,15 +2175,6 @@ impl FaceSearchApp {
                 self.matched_images_cache[idx].2 = !self.matched_images_cache[idx].2;
             }
             self.last_selected_index = Some(idx);
-        }
-
-        // Shift-click toggles a whole range, which is not ours to undo.
-        if let Some(idx) = undo_select {
-            if !ctx.input(|i| i.modifiers.shift) {
-                if let Some(entry) = self.matched_images_cache.get_mut(idx) {
-                    entry.2 = !entry.2;
-                }
-            }
         }
 
         if let Some(path) = open_trigger {
@@ -2449,7 +2364,6 @@ impl FaceSearchApp {
         self.spawn_thumbnail_loader(ctx, ThumbTarget::MetaSim);
 
         let mut clicked_idx: Option<usize> = None;
-        let mut undo_select: Option<usize> = None;
         let mut open_trigger: Option<PathBuf> = None;
         let mut view_trigger: Option<PathBuf> = None;
         let mut new_person_trigger: Option<PathBuf> = None;
@@ -2515,13 +2429,7 @@ impl FaceSearchApp {
                         };
                         let resp = resp.on_hover_text(hover);
 
-                        if resp.double_clicked() {
-                            open_trigger = Some(img_path.clone());
-                            // The first half of the double-click already toggled
-                            // selection; opening a photo should not change what
-                            // is staged for copying.
-                            undo_select = Some(idx);
-                        } else if resp.clicked() {
+                        if resp.clicked() {
                             clicked_idx = Some(idx);
                         }
 
@@ -2574,15 +2482,6 @@ impl FaceSearchApp {
                 self.metasim_images_cache[idx].1 = !self.metasim_images_cache[idx].1;
             }
             self.metasim_last_selected_index = Some(idx);
-        }
-
-        // Shift-click toggles a whole range, which is not ours to undo.
-        if let Some(idx) = undo_select {
-            if !ctx.input(|i| i.modifiers.shift) {
-                if let Some(entry) = self.metasim_images_cache.get_mut(idx) {
-                    entry.1 = !entry.1;
-                }
-            }
         }
 
         if let Some(path) = open_trigger {
@@ -2706,13 +2605,10 @@ impl FaceSearchApp {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let mut hover = match self.person_origins.get(&file_name) {
-                            Some(origin) => format!("{}\nOriginal: {}", file_name, origin.display()),
-                            None => format!(
-                                "{}\nOriginal location not recorded — the input directory will be searched for it.",
-                                file_name
-                            ),
-                        };
+                        let mut hover = format!(
+                            "{}\nRight-click \u{2192} \"Open in Explorer (original location)\" to search the input directory for where this came from.",
+                            file_name
+                        );
                         if let Some(Err(err)) = texture {
                             hover = format!("⚠ Could not preview this file: {}\n\n{}", err, hover);
                         }
@@ -2888,25 +2784,6 @@ mod tests {
         write(&dir.join("a_1.jpg"), "two");
         let second = get_unique_path(&dir, std::ffi::OsStr::new("a.jpg"));
         assert_eq!(second.file_name().unwrap(), "a_2.jpg");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn origins_round_trip_and_merge() {
-        let dir = scratch("origins");
-        assert!(load_origins(&dir).is_empty());
-
-        record_origins(&dir, &[("a.jpg".to_string(), PathBuf::from(r"D:\photos\a.jpg"))]);
-        record_origins(&dir, &[("b.jpg".to_string(), PathBuf::from(r"D:\photos\trip\b.jpg"))]);
-
-        let origins = load_origins(&dir);
-        assert_eq!(origins.len(), 2);
-        assert_eq!(origins["a.jpg"], PathBuf::from(r"D:\photos\a.jpg"));
-        assert_eq!(origins["b.jpg"], PathBuf::from(r"D:\photos\trip\b.jpg"));
-
-        // The sidecar is not an image, so it never shows up as a person photo.
-        assert!(!crate::utils::is_image(&origins_file(&dir)));
 
         fs::remove_dir_all(&dir).unwrap();
     }
