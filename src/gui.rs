@@ -431,6 +431,29 @@ fn record_origins(person_dir: &Path, entries: &[(String, PathBuf)]) {
     }
 }
 
+/// True if `path`'s contents byte-for-byte match a file already sorted into
+/// the people library. `target_filesizes` groups already-sorted files by size
+/// for a cheap first filter before falling back to a full read - the same
+/// "already seen" check `process_directory` uses for the Matches tab in
+/// `main.rs`, so a photo doesn't get re-suggested once it's been sorted.
+fn is_already_sorted(path: &Path, target_filesizes: &HashMap<u64, Vec<PathBuf>>) -> bool {
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    let Some(candidates) = target_filesizes.get(&size) else { return false; };
+    let Ok(bytes) = fs::read(path) else { return false; };
+
+    let canon_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    candidates.iter().any(|target| {
+        let canon_target = fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+        if canon_path == canon_target {
+            return false;
+        }
+        fs::read(target).map(|target_bytes| target_bytes == bytes).unwrap_or(false)
+    })
+}
+
 /// Open Explorer with `path` selected inside its containing folder.
 /// Command line Explorer needs to open a folder with `path` selected.
 ///
@@ -2171,12 +2194,23 @@ impl FaceSearchApp {
             return;
         }
 
-        // Photos already confirmed shouldn't also show up as "new" candidates.
-        let exclude: HashSet<PathBuf> = self
-            .person_origins
-            .values()
-            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-            .collect();
+        // Photos already sorted into *any* person's folder shouldn't show up as
+        // "new" candidates. Mirrors the "already seen" dedup `process_directory`
+        // uses for the Matches tab (main.rs): a byte-content comparison against
+        // everything already sitting in the people library, not just what the
+        // `.origins.json` sidecar happens to have recorded - this also catches
+        // photos added to a person folder outside this app, and copies that end
+        // up back in view because `target_dir` is nested inside `input_dir`.
+        let mut target_filesizes: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        if let Some(people_dir) = &self.people_dir {
+            for entry in WalkDir::new(people_dir).into_iter().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_file() && (crate::utils::is_image(path) || crate::utils::is_video(path)) {
+                    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    target_filesizes.entry(size).or_default().push(path.to_path_buf());
+                }
+            }
+        }
 
         self.metasim_scanning = true;
         self.status_msg = "Scanning input directory for similar timing…".to_string();
@@ -2191,10 +2225,7 @@ impl FaceSearchApp {
                 .filter(|e| e.file_type().is_file())
                 .map(|e| e.path().to_path_buf())
                 .filter(|p| crate::utils::is_image(p) || crate::utils::is_video(p))
-                .filter(|p| {
-                    let canon = fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                    !exclude.contains(&canon)
-                })
+                .filter(|p| !is_already_sorted(p, &target_filesizes))
                 .collect();
 
             let ranked = crate::metadata_similarity::rank_by_metadata(&anchors, candidates, window_secs);
