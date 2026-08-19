@@ -2186,6 +2186,12 @@ impl FaceSearchApp {
                             );
                         }
 
+                        let resp = if let Some(Err(err)) = texture {
+                            resp.on_hover_text(format!("⚠ Could not preview this file: {}", err))
+                        } else {
+                            resp
+                        };
+
                         if resp.double_clicked() {
                             open_trigger = Some(img_path.clone());
                             // The first half of the double-click already toggled
@@ -2503,7 +2509,11 @@ impl FaceSearchApp {
                             );
                         }
 
-                        let resp = resp.on_hover_text(candidate.explain());
+                        let hover = match texture {
+                            Some(Err(err)) => format!("⚠ Could not preview this file: {}\n\n{}", err, candidate.explain()),
+                            _ => candidate.explain(),
+                        };
+                        let resp = resp.on_hover_text(hover);
 
                         if resp.double_clicked() {
                             open_trigger = Some(img_path.clone());
@@ -2700,13 +2710,16 @@ impl FaceSearchApp {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        let hover = match self.person_origins.get(&file_name) {
+                        let mut hover = match self.person_origins.get(&file_name) {
                             Some(origin) => format!("{}\nOriginal: {}", file_name, origin.display()),
                             None => format!(
                                 "{}\nOriginal location not recorded — the input directory will be searched for it.",
                                 file_name
                             ),
                         };
+                        if let Some(Err(err)) = texture {
+                            hover = format!("⚠ Could not preview this file: {}\n\n{}", err, hover);
+                        }
 
                         resp.on_hover_text(hover).context_menu(|ui| {
                             if ui.button("📂 Open in Explorer (original location)").clicked() {
