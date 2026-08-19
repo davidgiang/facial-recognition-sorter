@@ -85,6 +85,19 @@ pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
         Err(e) => e,
     };
 
+    // `image::open` picks its decoder purely from the file extension, so a
+    // real photo saved/exported/renamed with the "wrong" extension (a valid,
+    // viewable image whose actual format doesn't match its suffix) fails the
+    // signature check immediately. Re-try letting the decoder sniff the real
+    // format from the file's own header bytes instead of trusting the name.
+    if let Ok(reader) = image::ImageReader::open(path) {
+        if let Ok(guessed) = reader.with_guessed_format() {
+            if let Ok(img) = guessed.decode() {
+                return Ok(img);
+            }
+        }
+    }
+
     let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
 
     // Camera RAW: try the pure-Rust raw pipeline (handles Canon CR2 and more).
