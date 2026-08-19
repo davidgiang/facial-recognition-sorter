@@ -77,10 +77,13 @@ fn decode_raw(path: &Path) -> anyhow::Result<image::DynamicImage> {
 }
 
 pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
-    // Try standard image crate first (jpg, png, gif, webp, tiff, ...)
-    if let Ok(img) = image::open(path) {
-        return Ok(img);
-    }
+    // Try standard image crate first (jpg, png, gif, webp, tiff, ...). Its
+    // error is kept (not discarded) so a final failure below can report the
+    // real reason instead of a generic "could not decode".
+    let standard_err = match image::open(path) {
+        Ok(img) => return Ok(img),
+        Err(e) => e,
+    };
 
     let ext = path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
 
@@ -112,7 +115,7 @@ pub fn load_image_robustly(path: &Path) -> anyhow::Result<image::DynamicImage> {
         }
     }
 
-    anyhow::bail!("Could not decode image: {}", path.display())
+    Err(anyhow::anyhow!("Could not decode image {}: {}", path.display(), standard_err))
 }
 
 pub fn get_video_thumbnail_path(video_path: &Path) -> PathBuf {
