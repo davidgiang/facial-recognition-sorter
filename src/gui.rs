@@ -250,6 +250,13 @@ pub struct FaceSearchApp {
     person_search_index: usize,
     person_search_scroll: bool,
 
+    // "Copy to Other Person" popup search box - separate from the main
+    // target-person picker above so it never touches the main selection.
+    other_person_search: String,
+    other_person_search_focus: bool,
+    other_person_search_index: usize,
+    other_person_search_scroll: bool,
+
     // Person folder tab state
     active_tab: Tab,
     /// Photo open in the pop-out viewer, from either tab.
@@ -351,6 +358,10 @@ impl Default for FaceSearchApp {
             person_search_focus: false,
             person_search_index: 0,
             person_search_scroll: false,
+            other_person_search: String::new(),
+            other_person_search_focus: false,
+            other_person_search_index: 0,
+            other_person_search_scroll: false,
             active_tab: Tab::Matches,
             viewer: None,
             person_files: Vec::new(),
@@ -1293,6 +1304,178 @@ impl FaceSearchApp {
             }
         }
     }
+
+    /// Button + search popup for copying the current selection to a person
+    /// other than the main target above, without changing that selection.
+    /// Returns the picked name the frame it's chosen, so the caller can act
+    /// on it - mirrors `person_selector_ui`'s search/arrow-key UX but reports
+    /// its pick instead of writing to `selected_person`.
+    fn other_person_picker_button(&mut self, ui: &mut egui::Ui, id_source: &str) -> Option<String> {
+        let popup_id = ui.make_persistent_id(id_source);
+        let button_resp = ui.button("Copy to Other Person...");
+        if button_resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+            self.other_person_search.clear();
+            self.other_person_search_focus = true;
+            self.other_person_search_index = 0;
+            self.other_person_search_scroll = true;
+        }
+
+        let mut chosen: Option<String> = None;
+        egui::popup_below_widget(
+            ui,
+            popup_id,
+            &button_resp,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(280.0);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.other_person_search)
+                        .hint_text("Type to search people...")
+                        .desired_width(f32::INFINITY),
+                );
+                if self.other_person_search_focus {
+                    search.request_focus();
+                    self.other_person_search_focus = false;
+                }
+                if search.changed() {
+                    self.other_person_search_index = 0;
+                }
+
+                let needle = self.other_person_search.trim().to_lowercase();
+                let filtered: Vec<&String> = self
+                    .people_names
+                    .iter()
+                    .filter(|name| needle.is_empty() || name.to_lowercase().contains(&needle))
+                    .collect();
+
+                let (up, down, enter) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                        i.key_pressed(egui::Key::Enter),
+                    )
+                });
+                let scroll_to_highlight = up || down || self.other_person_search_scroll;
+                if filtered.is_empty() {
+                    self.other_person_search_index = 0;
+                } else {
+                    self.other_person_search_index = self.other_person_search_index.min(filtered.len() - 1);
+                    if down {
+                        self.other_person_search_index = (self.other_person_search_index + 1) % filtered.len();
+                    }
+                    if up {
+                        self.other_person_search_index =
+                            (self.other_person_search_index + filtered.len() - 1) % filtered.len();
+                    }
+                    if enter {
+                        chosen = Some(filtered[self.other_person_search_index].clone());
+                    }
+                }
+
+                ui.label(
+                    egui::RichText::new(format!("{} of {} shown", filtered.len(), self.people_names.len()))
+                        .weak()
+                        .size(11.0),
+                );
+                ui.separator();
+
+                if filtered.is_empty() {
+                    ui.label(if self.people_names.is_empty() {
+                        "No person folders found in the library."
+                    } else {
+                        "No people match that search."
+                    });
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_source(format!("{id_source}_list"))
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for (idx, name) in filtered.iter().enumerate() {
+                            let highlighted = idx == self.other_person_search_index;
+                            let item = ui.selectable_label(highlighted, egui::RichText::new(*name));
+                            if item.clicked() {
+                                chosen = Some((*name).clone());
+                            }
+                            if highlighted && scroll_to_highlight {
+                                item.scroll_to_me(Some(egui::Align::Center));
+                            }
+                        }
+                    });
+                self.other_person_search_scroll = false;
+
+                if chosen.is_some() {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            },
+        );
+
+        chosen
+    }
+
+    /// Copy the selected Matches-tab candidates into `person_name`'s folder
+    /// (a person other than the main target above, which is left untouched).
+    fn copy_matched_selection_to_person(&mut self, person_name: &str) {
+        let Some(people_dir) = self.people_dir.clone() else { return };
+        let dest_dir = people_dir.join(person_name);
+        let mut copy_count = 0;
+        for (path, _, selected, _) in &self.matched_images_cache {
+            if *selected {
+                if let Some(file_name) = path.file_name() {
+                    let destination = get_unique_path(&dest_dir, file_name);
+                    if std::fs::copy(path, &destination).is_ok() {
+                        copy_count += 1;
+                    }
+                }
+            }
+        }
+
+        let removed: HashSet<PathBuf> = self.matched_images_cache.iter()
+            .filter(|(_, _, s, _)| *s)
+            .map(|(p, _, _, _)| p.clone())
+            .collect();
+        self.all_ranked_matches.retain(|(p, _)| !removed.contains(p));
+        self.matched_images_cache.retain(|(_, _, s, _)| !*s);
+
+        let max_page = if self.all_ranked_matches.is_empty() { 0 } else { self.total_pages() - 1 };
+        let reload_page = self.current_page.min(max_page);
+        self.load_page(reload_page);
+
+        self.status_msg = format!("Copied {} image(s) to '{}'.", copy_count, person_name);
+    }
+
+    /// Copy the selected Similar-Timing candidates into `person_name`'s
+    /// folder (a person other than the main target above, left untouched).
+    fn copy_metasim_selection_to_person(&mut self, person_name: &str) {
+        let Some(people_dir) = self.people_dir.clone() else { return };
+        let dest_dir = people_dir.join(person_name);
+        let mut copy_count = 0;
+        for (candidate, selected, _) in &self.metasim_images_cache {
+            if *selected {
+                let path = &candidate.path;
+                if let Some(file_name) = path.file_name() {
+                    let destination = get_unique_path(&dest_dir, file_name);
+                    if std::fs::copy(path, &destination).is_ok() {
+                        copy_count += 1;
+                    }
+                }
+            }
+        }
+
+        let removed: HashSet<PathBuf> = self.metasim_images_cache.iter()
+            .filter(|(_, s, _)| *s)
+            .map(|(c, ..)| c.path.clone())
+            .collect();
+        self.metasim_ranked.retain(|c| !removed.contains(&c.path));
+        self.metasim_images_cache.retain(|(c, ..)| !removed.contains(&c.path));
+
+        let max_page = if self.metasim_ranked.is_empty() { 0 } else { self.metasim_total_pages() - 1 };
+        let reload_page = self.metasim_page.min(max_page);
+        self.load_metasim_page(reload_page);
+
+        self.status_msg = format!("Copied {} image(s) to '{}'.", copy_count, person_name);
+    }
 }
 
 impl eframe::App for FaceSearchApp {
@@ -1602,6 +1785,9 @@ impl eframe::App for FaceSearchApp {
                         }
                         let selected_count = self.matched_images_cache.iter().filter(|(_, _, s, _)| *s).count();
                         if selected_count > 0 {
+                            if let Some(name) = self.other_person_picker_button(ui, "matches_other_person_popup") {
+                                self.copy_matched_selection_to_person(&name);
+                            }
                             if ui.button(format!("Copy {} Selected to Person Folder", selected_count)).clicked() {
                                 self.show_copy_confirm = true;
                             }
@@ -2339,6 +2525,9 @@ impl FaceSearchApp {
             if selected_count > 0 {
                 if ui.button(format!("Copy {} Selected to Person Folder", selected_count)).clicked() {
                     self.show_metasim_copy_confirm = true;
+                }
+                if let Some(name) = self.other_person_picker_button(ui, "metasim_other_person_popup") {
+                    self.copy_metasim_selection_to_person(&name);
                 }
             }
         });
