@@ -636,27 +636,17 @@ pub fn process_directory(
 
         std::thread::scope(|s| {
             // --- Producer thread: parallel decode + preprocess on CPU ---
-            let db_arc3 = Arc::clone(&db_arc);
             s.spawn(move || {
                 for (batch_idx, batch) in batches.into_iter().enumerate() {
-                    // Record files that fail to decode so they aren't retried every run
-                    let failed_paths: Vec<String> = batch
-                        .par_iter()
-                        .filter_map(|path| {
-                            match crate::utils::load_image_robustly(path) {
-                                Ok(_) => None,
-                                Err(_) => Some(path.to_string_lossy().to_string()),
-                            }
-                        })
-                        .collect();
-
-                    if !failed_paths.is_empty() {
-                        let mut db_guard = db_arc3.lock().unwrap();
-                        for path in failed_paths {
-                            db_guard.images.entry(path).or_insert_with(Vec::new);
-                        }
-                    }
-
+                    // Files that fail to decode are deliberately left out of
+                    // `db.images` entirely (not recorded as a 0-face entry),
+                    // unlike a successful decode that genuinely found no
+                    // faces. Both would otherwise look identical in the
+                    // database, and treating a decode failure as permanent
+                    // would silently hide files a future decoder fix (or a
+                    // sync tool finishing a download, etc.) could resolve -
+                    // leaving them out means they're simply retried, cheaply,
+                    // on the next scan instead of being stuck forever.
                     let decoded: DecodedBatch = batch
                         .par_iter()
                         .filter_map(|path| {
