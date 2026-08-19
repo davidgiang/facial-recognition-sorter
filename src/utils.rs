@@ -149,3 +149,12 @@ pub fn get_video_thumbnail_path(video_path: &Path) -> PathBuf {
     
     crate::get_app_data_dir().join("output").join("thumbnails").join(format!("{:x}.jpg", hash))
 }
+
+/// A cached video thumbnail only counts if it's a real, non-empty file. A
+/// 0-byte placeholder can be left behind when frame extraction found nothing
+/// to save; treating that the same as "file exists" makes it a permanent,
+/// silently-broken thumbnail that fails to decode forever instead of being
+/// regenerated.
+pub fn video_thumbnail_exists(thumb_path: &Path) -> bool {
+    std::fs::metadata(thumb_path).map(|m| m.len() > 0).unwrap_or(false)
+}

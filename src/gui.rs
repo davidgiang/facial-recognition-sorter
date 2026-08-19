@@ -536,7 +536,7 @@ fn find_original(input_dir: &Path, copy_path: &Path, size: u64) -> Option<PathBu
 /// cached thumbnail, and would otherwise render as an error tile.
 fn ensure_quick_video_thumbnail(video_path: &Path) -> Option<PathBuf> {
     let thumb_path = crate::utils::get_video_thumbnail_path(video_path);
-    if thumb_path.exists() {
+    if crate::utils::video_thumbnail_exists(&thumb_path) {
         return Some(thumb_path);
     }
     let ffmpeg = crate::utils::find_ffmpeg_path()?;
@@ -557,7 +557,7 @@ fn ensure_quick_video_thumbnail(video_path: &Path) -> Option<PathBuf> {
         .status()
         .ok()?;
 
-    (status.success() && thumb_path.exists()).then_some(thumb_path)
+    (status.success() && crate::utils::video_thumbnail_exists(&thumb_path)).then_some(thumb_path)
 }
 
 /// Where a file's downscaled thumbnail is cached. Keyed by path, size and

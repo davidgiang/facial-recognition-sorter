@@ -166,7 +166,7 @@ fn ensure_video_thumbnail(
     detector: &FaceDetector,
 ) -> anyhow::Result<PathBuf> {
     let thumb_path = crate::utils::get_video_thumbnail_path(video_path);
-    if thumb_path.exists() {
+    if crate::utils::video_thumbnail_exists(&thumb_path) {
         return Ok(thumb_path);
     }
 
@@ -215,14 +215,16 @@ fn ensure_video_thumbnail(
             } else if let Some(first) = frames.first() {
                 let _ = std::fs::create_dir_all(thumb_path.parent().unwrap());
                 let _ = std::fs::copy(first, &thumb_path);
-            } else {
-                 let _ = std::fs::create_dir_all(thumb_path.parent().unwrap());
-                 let _ = std::fs::File::create(&thumb_path);
             }
+            // No frame could be extracted at all: leave no file behind rather
+            // than writing an empty placeholder. An empty file would still
+            // satisfy an `exists()` check forever, permanently masking this
+            // video from ever being retried while also failing to decode
+            // every time something tries to actually show it.
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
-        
-        if thumb_path.exists() {
+
+        if crate::utils::video_thumbnail_exists(&thumb_path) {
             return Ok(thumb_path);
         }
     }
@@ -599,7 +601,7 @@ pub fn process_directory(
         } else if is_video {
             // Smart Backfill: If video is in DB but missing thumbnail, re-process it
             let thumb_path = crate::utils::get_video_thumbnail_path(&p);
-            if !thumb_path.exists() {
+            if !crate::utils::video_thumbnail_exists(&thumb_path) {
                 videos_to_process.push(p);
                 backfill_count += 1;
             }
