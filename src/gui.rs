@@ -2702,10 +2702,6 @@ impl FaceSearchApp {
                             paint_thumbnail(ui, rect, texture, path);
                         }
 
-                        if resp.clicked() {
-                            open_trigger = Some(path.clone());
-                        }
-
                         let file_name = path
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
