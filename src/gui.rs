@@ -2304,24 +2304,7 @@ impl FaceSearchApp {
             return;
         }
 
-        // Photos already sorted into *any* person's folder shouldn't show up as
-        // "new" candidates. Mirrors the "already seen" dedup `process_directory`
-        // uses for the Matches tab (main.rs): a byte-content comparison against
-        // everything already sitting in the people library, not just what the
-        // `.origins.json` sidecar happens to have recorded - this also catches
-        // photos added to a person folder outside this app, and copies that end
-        // up back in view because `target_dir` is nested inside `input_dir`.
-        let mut target_filesizes: HashMap<u64, Vec<PathBuf>> = HashMap::new();
-        if let Some(people_dir) = &self.people_dir {
-            for entry in WalkDir::new(people_dir).into_iter().filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_file() && (crate::utils::is_image(path) || crate::utils::is_video(path)) {
-                    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-                    target_filesizes.entry(size).or_default().push(path.to_path_buf());
-                }
-            }
-        }
-
+        let people_dir = self.people_dir.clone();
         self.metasim_scanning = true;
         self.status_msg = "Scanning input directory for similar timing…".to_string();
         let window_secs = (self.metasim_window_minutes.max(1.0) as i64) * 60;
@@ -2329,12 +2312,41 @@ impl FaceSearchApp {
         let ctx = ctx.clone();
 
         thread::spawn(move || {
-            let candidates: Vec<PathBuf> = WalkDir::new(&input_dir)
+            // Photos already sorted into *any* person's folder shouldn't show up
+            // as "new" candidates. Mirrors the "already seen" dedup
+            // `process_directory` uses for the Matches tab (main.rs): a
+            // byte-content comparison against everything already sitting in the
+            // people library, not just what the `.origins.json` sidecar happens
+            // to have recorded - this also catches photos added to a person
+            // folder outside this app, and copies that end up back in view
+            // because `target_dir` is nested inside `input_dir`.
+            //
+            // Built here on the background thread, not the click handler, so a
+            // large people library doesn't freeze the UI before scanning even
+            // shows as in progress.
+            let mut target_filesizes: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+            if let Some(people_dir) = &people_dir {
+                for entry in WalkDir::new(people_dir).into_iter().filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if path.is_file() && (crate::utils::is_image(path) || crate::utils::is_video(path)) {
+                        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                        target_filesizes.entry(size).or_default().push(path.to_path_buf());
+                    }
+                }
+            }
+
+            let walked: Vec<PathBuf> = WalkDir::new(&input_dir)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file())
                 .map(|e| e.path().to_path_buf())
                 .filter(|p| crate::utils::is_image(p) || crate::utils::is_video(p))
+                .collect();
+
+            // `is_already_sorted` reads whole files on a size collision, so run
+            // it in parallel rather than one file at a time.
+            let candidates: Vec<PathBuf> = walked
+                .into_par_iter()
                 .filter(|p| !is_already_sorted(p, &target_filesizes))
                 .collect();
 
