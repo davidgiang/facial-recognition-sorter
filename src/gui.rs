@@ -2182,15 +2182,10 @@ impl FaceSearchApp {
     fn start_metasim_scan(&mut self, ctx: &egui::Context) {
         let Some(input_dir) = self.input_dir.clone() else { return; };
 
-        let anchors: Vec<PathBuf> = self
-            .person_files
-            .iter()
-            .filter(|p| crate::utils::is_image(p))
-            .cloned()
-            .collect();
+        let anchors: Vec<PathBuf> = self.person_files.clone();
         if anchors.is_empty() {
             self.status_msg =
-                "No confirmed photos (images) in this person's folder to anchor the scan on.".to_string();
+                "No confirmed photos in this person's folder to anchor the scan on.".to_string();
             return;
         }
 
