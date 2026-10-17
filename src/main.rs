@@ -37,7 +37,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use walkdir::WalkDir;
 use crossbeam_channel::bounded;
 
@@ -249,6 +249,7 @@ pub fn process_directory(
     match_threshold_max: f32,
     filter_threshold: f32,
     tx: std::sync::mpsc::Sender<UiMessage>,
+    cancel: Arc<AtomicBool>,
 ) -> Result<()> {
     let log_file_path = crate::get_app_data_dir().join("output").join("run.log");
     let _ = std::fs::create_dir_all(log_file_path.parent().unwrap());
@@ -635,11 +636,13 @@ pub fn process_directory(
         let rec = Arc::clone(&recognizer);
         let db_arc2 = Arc::clone(&db_arc);
         let tx2 = tx.clone();
+        let cancel_producer = Arc::clone(&cancel);
 
         std::thread::scope(|s| {
             // --- Producer thread: parallel decode + preprocess on CPU ---
             s.spawn(move || {
                 for (batch_idx, batch) in batches.into_iter().enumerate() {
+                    if cancel_producer.load(Ordering::Relaxed) { break; }
                     // Files that fail to decode are deliberately left out of
                     // `db.images` entirely (not recorded as a 0-face entry),
                     // unlike a successful decode that genuinely found no
@@ -667,6 +670,7 @@ pub fn process_directory(
 
             // --- Consumer: GPU inference + postprocess + save ---
             for (batch_idx, decoded) in recv_decoded {
+                if cancel.load(Ordering::Relaxed) { break; }
                 let _ = tx2.send(UiMessage::Log(format!("Processing batch {}/{}...", batch_idx + 1, total_batches)));
 
                 let face_tensors: Vec<&crate::face::FacePreprocessed> = decoded.iter()
@@ -774,6 +778,11 @@ pub fn process_directory(
 
         drop(db_arc2);
         db = Arc::try_unwrap(db_arc).unwrap().into_inner().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            log!("Cancelled.");
+            let _ = tx.send(UiMessage::Cancelled);
+            return Ok(());
+        }
     } else {
         log!("No new images to process.");
     }
@@ -789,6 +798,7 @@ pub fn process_directory(
         let total_videos = videos_to_process.len();
 
         for (i, video_path) in videos_to_process.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) { break; }
             let msg = format!("Processing video {}/{}: {}", i + 1, total_videos, video_path.file_name().unwrap_or_default().to_string_lossy());
             let _ = tx.send(UiMessage::Log(msg.clone()));
             println!("{}", msg);
@@ -837,6 +847,11 @@ pub fn process_directory(
         }
         
         db = Arc::try_unwrap(db_arc).unwrap().into_inner().unwrap();
+        if cancel.load(Ordering::Relaxed) {
+            log!("Cancelled.");
+            let _ = tx.send(UiMessage::Cancelled);
+            return Ok(());
+        }
     } else {
         log!("No new videos to process.");
     }

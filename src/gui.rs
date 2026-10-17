@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 use crate::CommandHideExt;
@@ -34,6 +34,10 @@ const THUMB_CACHE_QUALITY: u8 = 80;
 
 /// Gap between thumbnails, horizontally and vertically.
 const THUMB_SPACING: f32 = 4.0;
+
+/// Timestamp proximity a Similar Timing candidate needs to be scored (filename-
+/// sequence neighbours are kept regardless). Not user-adjustable.
+const METASIM_WINDOW_SECS: i64 = 60 * 60;
 
 /// Longest edge the pop-out viewer decodes. Bigger than a thumbnail so a photo
 /// holds up when inspected, small enough to stay a quick decode.
@@ -230,6 +234,8 @@ pub struct FaceSearchApp {
     thumbnail_size: f32,
     current_page: usize,
     is_processing: bool,
+    /// Set by the Cancel button; the background run polls it between batches.
+    cancel_flag: Arc<AtomicBool>,
     status_msg: String,
 
     // Stats and Matches state
@@ -277,7 +283,6 @@ pub struct FaceSearchApp {
     person_thumb_gen: Arc<AtomicU64>,
 
     // "Similar Timing" (metadata-similarity) tab state
-    metasim_window_minutes: f32,
     metasim_scanning: bool,
     metasim_ranked: Vec<crate::metadata_similarity::MetaSimCandidate>,
     metasim_images_cache: Vec<(crate::metadata_similarity::MetaSimCandidate, bool, Option<Result<egui::TextureHandle, String>>)>,
@@ -311,6 +316,7 @@ pub enum UiMessage {
     Log(String),
     Done(usize, Vec<(PathBuf, f32)>), // (processed_count, sorted matches with euclidean distance)
     Error(String),
+    Cancelled,
 }
 
 impl Default for FaceSearchApp {
@@ -344,6 +350,7 @@ impl Default for FaceSearchApp {
             thumbnail_size: 300.0,
             current_page: 0,
             is_processing: false,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             status_msg: "Ready".to_string(),
             processed_count: 0,
             target_image_count: 0,
@@ -375,7 +382,6 @@ impl Default for FaceSearchApp {
             person_pending_thumbs: Vec::new(),
             matches_thumb_gen: Arc::new(AtomicU64::new(0)),
             person_thumb_gen: Arc::new(AtomicU64::new(0)),
-            metasim_window_minutes: 60.0,
             metasim_scanning: false,
             metasim_ranked: Vec::new(),
             metasim_images_cache: Vec::new(),
@@ -1608,6 +1614,21 @@ impl FaceSearchApp {
         self.status_msg = format!("Copied {} image(s) to '{}'.", copy_count, person_name);
     }
 
+    /// Drop a photo that has just been filed under a person from every
+    /// candidate list, so it doesn't linger in Matches or Similar Timing.
+    fn remove_candidate_everywhere(&mut self, path: &Path) {
+        if self.all_ranked_matches.iter().any(|(p, _)| p == path) {
+            self.all_ranked_matches.retain(|(p, _)| p != path);
+            let max_page = if self.all_ranked_matches.is_empty() { 0 } else { self.total_pages() - 1 };
+            self.load_page(self.current_page.min(max_page));
+        }
+        if self.metasim_ranked.iter().any(|c| c.path == path) {
+            self.metasim_ranked.retain(|c| c.path != path);
+            let max_page = if self.metasim_ranked.is_empty() { 0 } else { self.metasim_total_pages() - 1 };
+            self.load_metasim_page(self.metasim_page.min(max_page));
+        }
+    }
+
     /// Copy the selected Similar-Timing candidates into `person_name`'s
     /// folder (a person other than the main target above, left untouched).
     fn copy_metasim_selection_to_person(&mut self, person_name: &str) {
@@ -1645,6 +1666,14 @@ impl eframe::App for FaceSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_thumbnails(ctx);
 
+        // Preload the person folder as soon as a target is selected (or the app
+        // starts with one), so its tab is already filled when opened. Both calls
+        // are no-ops once the listing is loaded and its thumbnails are queued.
+        if self.target_dir.is_some() {
+            self.ensure_person_files_loaded();
+            self.spawn_thumbnail_loader(ctx, ThumbTarget::Person);
+        }
+
         // Handle incoming messages from background thread
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -1675,6 +1704,11 @@ impl eframe::App for FaceSearchApp {
                         );
                     }
                 }
+                UiMessage::Cancelled => {
+                    self.is_processing = false;
+                    self.log_messages.clear();
+                    self.status_msg = "Processing cancelled.".to_string();
+                }
                 UiMessage::Error(err) => {
                     self.is_processing = false;
                     self.log_messages.clear();
@@ -1693,7 +1727,7 @@ impl eframe::App for FaceSearchApp {
                     if total > 0 {
                         self.status_msg = format!("Found {} candidates by timing/camera/color similarity.", total);
                     } else {
-                        self.status_msg = "No candidates found within the time window.".to_string();
+                        self.status_msg = "No similar-timing candidates found.".to_string();
                     }
                 }
             }
@@ -1852,6 +1886,7 @@ impl eframe::App for FaceSearchApp {
                     if ui.button("Start Processing").clicked() {
                         self.update_target_count();
                         self.is_processing = true;
+                        self.cancel_flag.store(false, Ordering::Relaxed);
                         self.status_msg = "Starting...".to_string();
                         self.all_ranked_matches.clear();
                         self.matched_images_cache.clear();
@@ -1864,10 +1899,11 @@ impl eframe::App for FaceSearchApp {
                         let threshold_min = self.match_threshold_min.min(self.match_threshold);
                         let threshold_max = self.match_threshold;
                         let filter_threshold = self.filter_threshold;
+                        let cancel = Arc::clone(&self.cancel_flag);
 
                         thread::spawn(move || {
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                crate::process_directory(input, target_dir, people_dir, threshold_min, threshold_max, filter_threshold, tx_clone.clone())
+                                crate::process_directory(input, target_dir, people_dir, threshold_min, threshold_max, filter_threshold, tx_clone.clone(), cancel)
                             }));
                             match result {
                                 Ok(Err(e)) => {
@@ -1891,6 +1927,19 @@ impl eframe::App for FaceSearchApp {
                         self.show_rebuild_confirm = true;
                     }
                 });
+
+                // Right after Start Processing, so it appears in the same
+                // spot the moment a run begins.
+                if self.is_processing {
+                    let cancelling = self.cancel_flag.load(Ordering::Relaxed);
+                    if ui
+                        .add_enabled(!cancelling, egui::Button::new("✖ Cancel"))
+                        .clicked()
+                    {
+                        self.cancel_flag.store(true, Ordering::Relaxed);
+                        self.status_msg = "Cancelling...".to_string();
+                    }
+                }
 
                 if let Some(target_dir) = self.target_dir.clone() {
                     ui.add_space(16.0);
@@ -1945,15 +1994,6 @@ impl eframe::App for FaceSearchApp {
                                 }
                             }
                             self.status_msg = format!("Exported {} candidates to output folder.", self.all_ranked_matches.len());
-                        }
-                        let selected_count = self.matched_images_cache.iter().filter(|(_, _, s, _)| *s).count();
-                        if selected_count > 0 {
-                            if let Some(name) = self.other_person_picker_button(ui, "matches_other_person_popup") {
-                                self.copy_matched_selection_to_person(&name);
-                            }
-                            if ui.button(format!("Copy {} Selected to Person Folder", selected_count)).clicked() {
-                                self.show_copy_confirm = true;
-                            }
                         }
                     }
 
@@ -2304,11 +2344,10 @@ impl eframe::App for FaceSearchApp {
                                     "Created '{}' and copied image.",
                                     self.new_person_name.trim()
                                 );
+                                // Deliberately leave the target person alone:
+                                // switching is the user's call.
                                 self.refresh_people_names();
-                                self.selected_person = Some(self.new_person_name.trim().to_string());
-                                self.sync_target_dir_from_selection();
-                                self.update_target_count();
-                                self.save_settings();
+                                self.remove_candidate_everywhere(img_path);
                             } else {
                                 self.status_msg = "Failed to copy image.".to_string();
                             }
@@ -2343,7 +2382,7 @@ impl eframe::App for FaceSearchApp {
             }
 
             // --- Result Tabs ---
-            if !self.is_processing && self.target_dir.is_some() {
+            {
                 ui.separator();
                 ui.horizontal(|ui| {
                     let matches_label =
@@ -2359,6 +2398,8 @@ impl eframe::App for FaceSearchApp {
                     ui.selectable_value(&mut self.active_tab, Tab::MetadataSimilarity, metasim_label);
                 });
 
+                self.tab_toolbar(ui, ctx);
+
                 match self.active_tab {
                     Tab::Matches => self.show_matches_tab(ui, ctx),
                     Tab::PersonFolder => self.show_person_tab(ui, ctx),
@@ -2372,6 +2413,124 @@ impl eframe::App for FaceSearchApp {
 }
 
 impl FaceSearchApp {
+    /// The row under the tab strip. Pagination and actions sit in fixed slots
+    /// from the left, so nothing shifts when switching tabs.
+    /// Buttons that don't apply right now are disabled rather than removed.
+    fn tab_toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.active_tab != Tab::Matches {
+            self.ensure_person_files_loaded();
+        }
+
+        let (page, total_pages, label, selected_count) = match self.active_tab {
+            Tab::Matches => {
+                let total = self.all_ranked_matches.len();
+                let sel = self.matched_images_cache.iter().filter(|(_, _, s, _)| *s).count();
+                let label = if total == 0 {
+                    "No candidates yet".to_string()
+                } else {
+                    let start = self.current_page * self.page_size + 1;
+                    let end = ((self.current_page + 1) * self.page_size).min(total);
+                    format!("Page {}/{} — {} candidates, showing {}-{} ({} selected)",
+                        self.current_page + 1, self.total_pages(), total, start, end, sel)
+                };
+                (self.current_page, self.total_pages(), label, sel)
+            }
+            Tab::PersonFolder => {
+                let total = self.person_files.len();
+                let label = if total == 0 {
+                    "Person folder is empty".to_string()
+                } else {
+                    let start = self.person_page * self.page_size + 1;
+                    let end = ((self.person_page + 1) * self.page_size).min(total);
+                    format!("Page {}/{} — showing {}-{} of {}",
+                        self.person_page + 1, self.person_total_pages(), start, end, total)
+                };
+                (self.person_page, self.person_total_pages(), label, 0)
+            }
+            Tab::MetadataSimilarity => {
+                let total = self.metasim_ranked.len();
+                let sel = self.metasim_images_cache.iter().filter(|(_, s, _)| *s).count();
+                let label = if total == 0 {
+                    "No results yet".to_string()
+                } else {
+                    let start = self.metasim_page * self.page_size + 1;
+                    let end = ((self.metasim_page + 1) * self.page_size).min(total);
+                    format!("Page {}/{} — {} candidates, showing {}-{} ({} selected)",
+                        self.metasim_page + 1, self.metasim_total_pages(), total, start, end, sel)
+                };
+                (self.metasim_page, self.metasim_total_pages(), label, sel)
+            }
+        };
+
+        let mut new_page: Option<usize> = None;
+
+        ui.horizontal(|ui| {
+            if ui.add_enabled(page > 0, egui::Button::new("< Prev")).clicked() {
+                new_page = Some(page - 1);
+            }
+            if ui
+                .add_enabled(page + 1 < total_pages, egui::Button::new("Next >"))
+                .clicked()
+            {
+                new_page = Some(page + 1);
+            }
+
+            // Actions follow the pagination in fixed slots, set off by a
+            // divider. The variable-width page label goes last so it can't
+            // push them around.
+            if self.active_tab != Tab::PersonFolder {
+                ui.separator();
+                ui.add_enabled_ui(selected_count > 0, |ui| {
+                    if ui
+                        .button(format!("Copy {} Selected to Person Folder", selected_count))
+                        .clicked()
+                    {
+                        match self.active_tab {
+                            Tab::Matches => self.show_copy_confirm = true,
+                            _ => self.show_metasim_copy_confirm = true,
+                        }
+                    }
+                    let popup_id = match self.active_tab {
+                        Tab::Matches => "matches_other_person_popup",
+                        _ => "metasim_other_person_popup",
+                    };
+                    if let Some(name) = self.other_person_picker_button(ui, popup_id) {
+                        match self.active_tab {
+                            Tab::Matches => self.copy_matched_selection_to_person(&name),
+                            _ => self.copy_metasim_selection_to_person(&name),
+                        }
+                    }
+                });
+            }
+            if self.active_tab == Tab::MetadataSimilarity {
+                ui.separator();
+                let can_scan = !self.metasim_scanning
+                    && self.input_dir.is_some()
+                    && !self.person_files.is_empty();
+                if ui
+                    .add_enabled(can_scan, egui::Button::new("🔎 Scan for Similar Timing"))
+                    .clicked()
+                {
+                    self.start_metasim_scan(ctx);
+                }
+                if self.metasim_scanning {
+                    ui.spinner();
+                }
+            }
+
+            ui.separator();
+            ui.add(egui::Label::new(label.as_str()).truncate());
+        });
+
+        if let Some(p) = new_page {
+            match self.active_tab {
+                Tab::Matches => self.load_page(p),
+                Tab::PersonFolder => self.load_person_page(p),
+                Tab::MetadataSimilarity => self.load_metasim_page(p),
+            }
+        }
+    }
+
     /// Candidates found in the input directory, ranked best-match-first.
     fn show_matches_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.matched_images_cache.is_empty() {
@@ -2379,35 +2538,11 @@ impl FaceSearchApp {
             return;
         }
 
-        let selected_count = self.matched_images_cache.iter().filter(|(_, _, s, _)| *s).count();
-        let total_pages = self.total_pages();
-        let total_matches = self.all_ranked_matches.len();
-        let page_start = self.current_page * self.page_size + 1;
-        let page_end = ((self.current_page + 1) * self.page_size).min(total_matches);
-
-        ui.label(format!(
-            "Page {}/{} — {} total candidates, showing {}-{} ({} selected on this page)",
-            self.current_page + 1, total_pages, total_matches, page_start, page_end, selected_count
-        ));
-
-        // Pagination controls
-        ui.horizontal(|ui| {
-            let on_first = self.current_page == 0;
-            let on_last = self.current_page + 1 >= total_pages;
-            if ui.add_enabled(!on_first, egui::Button::new("< Prev")).clicked() {
-                let prev = self.current_page - 1;
-                self.load_page(prev);
-            }
-            if ui.add_enabled(!on_last, egui::Button::new("Next >")).clicked() {
-                let next = self.current_page + 1;
-                self.load_page(next);
-            }
-            ui.label(
-                egui::RichText::new("Click to select · double-click to open in your photo app · right-click for more")
-                    .weak()
-                    .size(11.0),
-            );
-        });
+        ui.label(
+            egui::RichText::new("Click to select · double-click to open in your photo app · right-click for more")
+                .weak()
+                .size(11.0),
+        );
 
         self.spawn_thumbnail_loader(ctx, ThumbTarget::Matches);
 
@@ -2577,7 +2712,7 @@ impl FaceSearchApp {
         let people_dir = self.people_dir.clone();
         self.metasim_scanning = true;
         self.status_msg = "Scanning input directory for similar timing…".to_string();
-        let window_secs = (self.metasim_window_minutes.max(1.0) as i64) * 60;
+        let window_secs = METASIM_WINDOW_SECS;
         let tx = self.metasim_tx.clone();
         let ctx = ctx.clone();
 
@@ -2640,30 +2775,11 @@ impl FaceSearchApp {
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.label("Time window:");
-            ui.add(
-                egui::DragValue::new(&mut self.metasim_window_minutes)
-                    .range(1.0..=1440.0)
-                    .suffix(" min"),
-            );
-            ui.add_enabled_ui(!self.metasim_scanning && self.input_dir.is_some(), |ui| {
-                if ui.button("🔎 Scan for Similar Timing").clicked() {
-                    self.start_metasim_scan(ctx);
-                }
-            });
-            if self.metasim_scanning {
-                ui.spinner();
-                ui.label("Scanning…");
-            }
-        });
         ui.label(
             egui::RichText::new(
                 "Ranks input-directory photos by how close their filename sequence number, timestamp, \
                  pixel dimensions, camera, and GPS location are to photos already confirmed for this \
-                 person - useful when their face is covered or turned away. A photo sitting right next \
-                 to a confirmed one in the filename sequence is kept even if its timestamp falls outside \
-                 the window below. Hover a photo for the full breakdown.",
+                 person - useful when their face is covered or turned away. Hover a photo for the full breakdown.",
             )
             .weak()
             .size(11.0),
@@ -2676,45 +2792,11 @@ impl FaceSearchApp {
             return;
         }
 
-        let total = self.metasim_ranked.len();
-        let total_pages = self.metasim_total_pages();
-        let page_start = self.metasim_page * self.page_size + 1;
-        let page_end = ((self.metasim_page + 1) * self.page_size).min(total);
-        let selected_count = self.metasim_images_cache.iter().filter(|(_, s, _)| *s).count();
-
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(format!(
-                "Page {}/{} — {} total candidates, showing {}-{} ({} selected on this page)",
-                self.metasim_page + 1, total_pages, total, page_start, page_end, selected_count
-            ));
-            if selected_count > 0 {
-                if ui.button(format!("Copy {} Selected to Person Folder", selected_count)).clicked() {
-                    self.show_metasim_copy_confirm = true;
-                }
-                if let Some(name) = self.other_person_picker_button(ui, "metasim_other_person_popup") {
-                    self.copy_metasim_selection_to_person(&name);
-                }
-            }
-        });
-
-        ui.horizontal(|ui| {
-            let on_first = self.metasim_page == 0;
-            let on_last = self.metasim_page + 1 >= total_pages;
-            if ui.add_enabled(!on_first, egui::Button::new("< Prev")).clicked() {
-                let prev = self.metasim_page - 1;
-                self.load_metasim_page(prev);
-            }
-            if ui.add_enabled(!on_last, egui::Button::new("Next >")).clicked() {
-                let next = self.metasim_page + 1;
-                self.load_metasim_page(next);
-            }
-            ui.label(
-                egui::RichText::new("Click to select · double-click to open in your photo app · right-click for more")
-                    .weak()
-                    .size(11.0),
-            );
-        });
+        ui.label(
+            egui::RichText::new("Click to select · double-click to open in your photo app · right-click for more")
+                .weak()
+                .size(11.0),
+        );
 
         self.spawn_thumbnail_loader(ctx, ThumbTarget::MetaSim);
 
@@ -2906,30 +2988,11 @@ impl FaceSearchApp {
             self.load_person_page(page);
         }
 
-        let page_start = self.person_page * self.page_size + 1;
-        let page_end = ((self.person_page + 1) * self.page_size).min(total);
-        ui.label(format!(
-            "Page {}/{} — showing {}-{} of {}",
-            self.person_page + 1, total_pages, page_start, page_end, total
-        ));
-
-        ui.horizontal(|ui| {
-            let on_first = self.person_page == 0;
-            let on_last = self.person_page + 1 >= total_pages;
-            if ui.add_enabled(!on_first, egui::Button::new("< Prev")).clicked() {
-                let prev = self.person_page - 1;
-                self.load_person_page(prev);
-            }
-            if ui.add_enabled(!on_last, egui::Button::new("Next >")).clicked() {
-                let next = self.person_page + 1;
-                self.load_person_page(next);
-            }
-            ui.label(
-                egui::RichText::new("Click to open in your photo app · right-click for the built-in viewer, original location or delete")
-                    .weak()
-                    .size(11.0),
-            );
-        });
+        ui.label(
+            egui::RichText::new("Click to open in your photo app · right-click for the built-in viewer, original location or delete")
+                .weak()
+                .size(11.0),
+        );
 
         self.spawn_thumbnail_loader(ctx, ThumbTarget::Person);
 
